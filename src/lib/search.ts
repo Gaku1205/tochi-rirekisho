@@ -1,5 +1,27 @@
 // 入れた住所から、町を探す。福岡市の外や、記録の無い町は見つからない。
+import { distanceMeters, type LatLon } from "./geo";
 import { PLACES, type Place } from "./places";
+
+/** 地図で選んだ地点を、記録のある町に結びつける最大の距離（m） */
+export const POINT_RANGE_M = 1500;
+
+export type PointResult =
+  | { kind: "found"; place: Place; meters: number }
+  | { kind: "outside"; meters: number };
+
+/** 緯度経度から、いちばん近い記録のある町を探す。POINT_RANGE_M を超えたら範囲の外 */
+export function searchPoint(at: LatLon): PointResult {
+  let best = PLACES[0];
+  let meters = distanceMeters(at, best.at);
+  for (const p of PLACES.slice(1)) {
+    const d = distanceMeters(at, p.at);
+    if (d < meters) {
+      best = p;
+      meters = d;
+    }
+  }
+  return meters <= POINT_RANGE_M ? { kind: "found", place: best, meters } : { kind: "outside", meters };
+}
 
 export type SearchResult =
   | { kind: "found"; place: Place }

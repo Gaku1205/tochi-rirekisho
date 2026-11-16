@@ -26,6 +26,7 @@ export default function MapPanel({ place, marks }: Props) {
         left={info.layer}
         leftLabel={info.label}
         marks={marks}
+        pickable
         ariaLabel={`${place.town}${place.block}のまわりの地図。左は${info.label}、右はいまの地図`}
       />
       <div className="strip" role="group" aria-label="年代">
@@ -42,6 +43,7 @@ export default function MapPanel({ place, marks }: Props) {
           </button>
         ))}
       </div>
+      <p className="side-note">地図を押すと、その地点を調べられます（スマホは長押し）</p>
     </aside>
   );
 }
