@@ -13,12 +13,20 @@ const WEIGHTS: Record<keyof Features, number> = {
 };
 
 const KEYS = Object.keys(WEIGHTS) as (keyof Features)[];
-const MAX_DISTANCE = Math.sqrt(KEYS.reduce((s, k) => s + WEIGHTS[k], 0));
 
-/** 0〜1。1 が同じ */
+/** 0〜1。1 が同じ。どちらかが null（データなし）の特徴は使わず、残りの特徴だけで比べる */
 export function similarity(a: Features, b: Features): number {
-  const d = Math.sqrt(KEYS.reduce((s, k) => s + WEIGHTS[k] * (a[k] - b[k]) ** 2, 0));
-  return Math.round((1 - d / MAX_DISTANCE) * 100) / 100;
+  let sum = 0;
+  let max = 0;
+  for (const k of KEYS) {
+    const x = a[k];
+    const y = b[k];
+    if (x === null || y === null) continue;
+    sum += WEIGHTS[k] * (x - y) ** 2;
+    max += WEIGHTS[k];
+  }
+  if (max === 0) return 0;
+  return Math.round((1 - Math.sqrt(sum) / Math.sqrt(max)) * 100) / 100;
 }
 
 export function similarityWord(score: number): string {
@@ -30,7 +38,7 @@ export function similarityWord(score: number): string {
 
 /** いちばん効いた共通点を1つ、言葉で */
 export function sharedTrait(a: Features, b: Features): string {
-  const traits: { key: keyof Features; word: string }[] = [
+  const traits: { key: "paddy" | "forest" | "sand" | "town"; word: string }[] = [
     { key: "paddy", word: "昔は田んぼ" },
     { key: "forest", word: "昔は林の丘" },
     { key: "sand", word: "昔は砂丘・松原" },
@@ -39,7 +47,16 @@ export function sharedTrait(a: Features, b: Features): string {
   const best = traits
     .map((t) => ({ ...t, v: Math.min(a[t.key], b[t.key]) }))
     .sort((x, y) => y.v - x.v)[0];
-  const flood = a.flood > 0.15 && b.flood > 0.15 ? "・浸水の想定あり" : a.flood === 0 && b.flood === 0 ? "・浸水の想定なし" : "";
+  const fa = a.flood;
+  const fb = b.flood;
+  const flood =
+    fa === null || fb === null
+      ? ""
+      : fa > 0.15 && fb > 0.15
+        ? "・浸水の想定あり"
+        : fa === 0 && fb === 0
+          ? "・浸水の想定なし"
+          : "";
   return best.v > 0.3 ? `${best.word}${flood}` : `地盤が近い${flood}`;
 }
 

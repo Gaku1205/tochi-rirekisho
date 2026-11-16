@@ -825,6 +825,12 @@ a {
   line-height: 1.15;
 }
 
+/* 浸水のデータなし：薄墨の控えめな言葉。赤や警告の色は使わない */
+.hz-nodata {
+  color: var(--soft);
+  font-size: 34px;
+}
+
 .sim {
   margin-top: 80px;
 }

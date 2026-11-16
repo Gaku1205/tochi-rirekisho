@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GET } from "../app/api/summary/route";
+import { floodValue } from "./flood";
 import { placeBySlug, DEFAULT_PLACE } from "./places";
 import { checkSummary } from "./summaryCheck";
 import { buildSummaryPrompt } from "./summaryPrompt";
@@ -13,7 +14,7 @@ describe("summaryTable", () => {
     const t = summaryTable(ohashi);
     expect(t).toContain("福岡市南区大橋2丁目");
     for (const e of ohashi.eras) expect(t).toContain(`${e.era}年 ${e.title}`);
-    expect(t).toContain(ohashi.flood.value);
+    expect(t).toContain(`浸水の想定: ${floodValue(ohashi.flood)}`);
     expect(t).toContain(ohashi.ground.value);
     expect(t).toContain("41.6万円");
   });

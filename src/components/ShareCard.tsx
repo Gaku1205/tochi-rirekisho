@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { CARD, sheetCrop, wrapText } from "@/lib/card";
 import { OLD_MAP } from "@/lib/layers";
 import { StaticMap } from "./MapLayers";
+import { floodValue, NO_DATA } from "@/lib/flood";
 import type { Place } from "@/lib/places";
 
 const C = {
@@ -97,7 +98,7 @@ async function draw(canvas: HTMLCanvasElement, place: Place) {
   const rowH = 70;
   const rows: [string, string, boolean][] = [
     ...place.eras.map((e) => [e.era, e.title, true] as [string, string, boolean]),
-    ["浸水の想定", place.flood.value, false],
+    ["浸水の想定", floodValue(place.flood), false],
     ["地盤", place.ground.value, false],
     ["地価", `1㎡あたり ${place.price.manYen.toFixed(1)}万円`, false],
   ];
@@ -132,7 +133,7 @@ async function draw(canvas: HTMLCanvasElement, place: Place) {
     ctx.fillStyle = isYear ? C.ink : C.soft;
     ctx.font = isYear ? `500 48px ${fYear}` : `500 30px ${fJp}`;
     ctx.fillText(k, boxX + pad + 24, ry + (isYear ? 54 : 47));
-    ctx.fillStyle = C.ink;
+    ctx.fillStyle = v === NO_DATA ? C.soft : C.ink;
     ctx.font = `700 34px ${fJp}`;
     ctx.fillText(v, boxX + pad + 240, ry + 48);
   });
