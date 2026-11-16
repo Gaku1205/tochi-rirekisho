@@ -3,6 +3,7 @@ import Link from "next/link";
 import { StaticMap } from "./MapLayers";
 import SearchForm from "./SearchForm";
 import { ERA_INFO } from "@/lib/layers";
+import { floodNote, floodValue, NO_DATA } from "@/lib/flood";
 import { address, fullName, type Place } from "@/lib/places";
 import type { SimilarPlace } from "@/lib/similar";
 
@@ -73,8 +74,12 @@ export default function RecordSheet({
         ))}
         <li className="hz" data-reveal="row">
           <span className="k">浸水の想定</span>
-          <span className="yr hz-fig">{place.flood.value}</span>
-          <p>{place.flood.note}</p>
+          {place.flood.depth === null ? (
+            <span className="name hz-word hz-nodata">{NO_DATA}</span>
+          ) : (
+            <span className="yr hz-fig">{floodValue(place.flood)}</span>
+          )}
+          <p>{floodNote(place.flood)}</p>
         </li>
         <li className="hz" data-reveal="row">
           <span className="k">地盤</span>
@@ -122,7 +127,7 @@ export default function RecordSheet({
 
       <p className="credit">
         地図：五万分の一地形図「FUKUOKA」（米陸軍地図局、1945年刷り。もとは1926〜29年の日本の測量）パブリックドメイン、Wikimedia
-        Commons／空中写真と今の地図：地理院タイル（国土地理院）／浸水・地盤・地価：国土数値情報、福岡市の洪水ハザードマップ、地価公示をもとにした試作の値。
+        Commons／空中写真と今の地図：地理院タイル（国土地理院）／浸水：国土数値情報の洪水浸水想定区域（国土交通省）を町の地点で調べた値／地盤・地価：土地条件図、地価公示をもとにした試作の値。
         <Link href="/about">データの出どころ</Link>
       </p>
     </div>

@@ -1,0 +1,22 @@
+{
+  "source": {
+    "name": "国土数値情報 洪水浸水想定区域データ",
+    "version": null,
+    "retrievedAt": null,
+    "memo": "取得できなかったため、値は未確認（null）。確かめられた町から入れていく。"
+  },
+  "places": [
+    { "slug": "ohashi-2", "depth": null, "river": null },
+    { "slug": "iseri-3", "depth": null, "river": null },
+    { "slug": "takeshita-3", "depth": null, "river": null },
+    { "slug": "itazuke-3", "depth": null, "river": null },
+    { "slug": "tamura-3", "depth": null, "river": null },
+    { "slug": "meinohama-ekiminami-1", "depth": null, "river": null },
+    { "slug": "befu-3", "depth": null, "river": null },
+    { "slug": "nishijin-4", "depth": null, "river": null },
+    { "slug": "ropponmatsu-2", "depth": null, "river": null },
+    { "slug": "nagaoka-3", "depth": null, "river": null },
+    { "slug": "hakozaki-1", "depth": null, "river": null },
+    { "slug": "maizuru-2", "depth": null, "river": null }
+  ]
+}

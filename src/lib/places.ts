@@ -1,13 +1,14 @@
 // 福岡市の町ごとの記録。年代ごとの土地の様子・浸水・地盤・地価と、AIが読み解いた要約。
-// 数値は、地形図・空中写真・浸水想定区域・土地条件図・地価公示を地点で重ねて写した試作の値。
+// 浸水は国土数値情報の洪水浸水想定区域（src/data/flood.json）から作る。地盤・地価の数値は試作の値。
 import type { Era } from "./layers";
 import type { LatLon } from "./geo";
+import { floodFeature, floodFor, type Flood } from "./flood";
 
 export type Ward = "東区" | "博多区" | "中央区" | "南区" | "城南区" | "早良区" | "西区";
 
 export type EraRow = { era: Era; title: string; text: string };
 
-/** 似た土地を探すための特徴（どれも 0〜1） */
+/** 似た土地を探すための特徴（どれも 0〜1。flood だけ、データが無い町は null） */
 export type Features = {
   /** 1926年の地形図で田んぼだった割合 */
   paddy: number;
@@ -17,8 +18,8 @@ export type Features = {
   town: number;
   /** 砂浜・砂丘・松原だった割合 */
   sand: number;
-  /** 浸水の想定の深さ（3m で 1） */
-  flood: number;
+  /** 浸水の想定の深さ（3m で 1）。データなしは null で、比べるときは使わない */
+  flood: number | null;
   /** 低い土地か（低地 1・台地 0.4・丘や砂丘 0） */
   lowland: number;
   /** 川までの近さ（すぐそば 1、2km 以上 0） */
@@ -40,13 +41,15 @@ export type Place = {
   at: LatLon;
   summary: string;
   eras: EraRow[];
-  flood: { value: string; note: string };
+  flood: Flood;
   ground: { value: string; note: string };
   price: { manYen: number; change10y: number; note: string };
   features: Features;
 };
 
-export const PLACES: Place[] = [
+type RawPlace = Omit<Place, "flood" | "features"> & { features: Omit<Features, "flood"> };
+
+const RAW_PLACES: RawPlace[] = [
   {
     slug: "ohashi-2",
     ward: "南区",
@@ -63,10 +66,9 @@ export const PLACES: Place[] = [
       { era: "1975", title: "住宅地へ", text: "区画整理で田が埋められ、2階建ての家とアパートが並ぶ。" },
       { era: "2026", title: "駅前の住宅地", text: "西鉄大橋駅から歩いて6分。マンションと戸建てが混じる。" },
     ],
-    flood: { value: "0.5〜1.0m", note: "那珂川があふれたときの想定（最大規模）。2階は届かない高さ。" },
     ground: { value: "川が運んだ砂と泥の低地", note: "昔の田んぼの上。揺れはやや大きく出やすい。" },
     price: { manYen: 41.6, change10y: 38, note: "公示地価の近くの地点" },
-    features: { paddy: 0.85, forest: 0, town: 0.1, sand: 0, flood: 0.25, lowland: 1, river: 0.9, late: 0.55 },
+    features: { paddy: 0.85, forest: 0, town: 0.1, sand: 0, lowland: 1, river: 0.9, late: 0.55 },
   },
   {
     slug: "iseri-3",
@@ -84,10 +86,9 @@ export const PLACES: Place[] = [
       { era: "1975", title: "住宅地へ", text: "田のほとんどが家に変わり、細い道が碁盤に通る。" },
       { era: "2026", title: "駅に近い住宅地", text: "戸建てと低いマンション。商店街が駅から東へのびる。" },
     ],
-    flood: { value: "0.5〜1.0m", note: "那珂川・諸岡川があふれたときの想定（最大規模）。" },
     ground: { value: "川が運んだ砂と泥の低地", note: "田の上に盛った土地。地下水は浅い。" },
     price: { manYen: 27.9, change10y: 31, note: "公示地価の近くの地点" },
-    features: { paddy: 0.75, forest: 0, town: 0.2, sand: 0, flood: 0.25, lowland: 1, river: 0.6, late: 0.45 },
+    features: { paddy: 0.75, forest: 0, town: 0.2, sand: 0, lowland: 1, river: 0.6, late: 0.45 },
   },
   {
     slug: "takeshita-3",
@@ -105,10 +106,9 @@ export const PLACES: Place[] = [
       { era: "1975", title: "工場と住宅", text: "田が消え、工場・倉庫・家が入り混じる。" },
       { era: "2026", title: "駅前の住宅地", text: "工場の跡がマンションに。竹下駅まで歩いて5分。" },
     ],
-    flood: { value: "1.0〜3.0m", note: "那珂川があふれたときの想定（最大規模）。1階は浸かる高さ。" },
     ground: { value: "川が運んだ砂と泥の低地", note: "田と川の跡。揺れはやや大きく出やすい。" },
     price: { manYen: 36.2, change10y: 42, note: "公示地価の近くの地点" },
-    features: { paddy: 0.7, forest: 0, town: 0.15, sand: 0, flood: 0.6, lowland: 1, river: 0.85, late: 0.4 },
+    features: { paddy: 0.7, forest: 0, town: 0.15, sand: 0, lowland: 1, river: 0.85, late: 0.4 },
   },
   {
     slug: "itazuke-3",
@@ -126,10 +126,9 @@ export const PLACES: Place[] = [
       { era: "1975", title: "田んぼと住宅", text: "道ぞいから家が建ち始め、田と家がまだら。" },
       { era: "2026", title: "住宅地", text: "戸建ての住宅地。公園と遺跡の広場が近い。" },
     ],
-    flood: { value: "0.5〜1.0m", note: "御笠川があふれたときの想定（最大規模）。" },
     ground: { value: "川が運んだ砂と泥の低地", note: "昔からの田の土。揺れはやや大きく出やすい。" },
     price: { manYen: 19.4, change10y: 27, note: "公示地価の近くの地点" },
-    features: { paddy: 0.9, forest: 0, town: 0.05, sand: 0, flood: 0.25, lowland: 1, river: 0.55, late: 0.75 },
+    features: { paddy: 0.9, forest: 0, town: 0.05, sand: 0, lowland: 1, river: 0.55, late: 0.75 },
   },
   {
     slug: "tamura-3",
@@ -147,10 +146,9 @@ export const PLACES: Place[] = [
       { era: "1975", title: "区画整理", text: "田が埋められ、まっすぐな道が引かれ始める。" },
       { era: "2026", title: "住宅地", text: "戸建てが並ぶ住宅地。川ぞいに遊歩道。" },
     ],
-    flood: { value: "0.5〜3.0m", note: "室見川があふれたときの想定（最大規模）。川に近いほど深い。" },
     ground: { value: "川が運んだ砂と泥の低地", note: "昔の田と川原の上。" },
     price: { manYen: 17.8, change10y: 24, note: "公示地価の近くの地点" },
-    features: { paddy: 0.8, forest: 0.05, town: 0.05, sand: 0, flood: 0.4, lowland: 1, river: 0.85, late: 0.65 },
+    features: { paddy: 0.8, forest: 0.05, town: 0.05, sand: 0, lowland: 1, river: 0.85, late: 0.65 },
   },
   {
     slug: "meinohama-ekiminami-1",
@@ -168,10 +166,9 @@ export const PLACES: Place[] = [
       { era: "1975", title: "田んぼと家", text: "道ぞいに家が増え、田がまだ半分残る。" },
       { era: "2026", title: "駅前の住宅地", text: "マンションが多い。地下鉄で天神まで15分。" },
     ],
-    flood: { value: "0.5〜1.0m", note: "名柄川があふれたときの想定（最大規模）。高潮の想定もある。" },
     ground: { value: "海と川がつくった低地", note: "砂と泥が重なる。揺れはやや大きく出やすい。" },
     price: { manYen: 38.5, change10y: 45, note: "公示地価の近くの地点" },
-    features: { paddy: 0.75, forest: 0, town: 0.1, sand: 0.1, flood: 0.25, lowland: 1, river: 0.6, late: 0.8 },
+    features: { paddy: 0.75, forest: 0, town: 0.1, sand: 0.1, lowland: 1, river: 0.6, late: 0.8 },
   },
   {
     slug: "befu-3",
@@ -189,10 +186,9 @@ export const PLACES: Place[] = [
       { era: "1975", title: "住宅地", text: "田はほぼ消え、家とアパートが並ぶ。" },
       { era: "2026", title: "住宅地", text: "戸建てと低いマンション。大学が近い。" },
     ],
-    flood: { value: "0.5m未満", note: "樋井川があふれたときの想定（最大規模）。川ぞいだけ。" },
     ground: { value: "低地と台地のさかい", note: "西半分は田の跡、東は古い砂と礫の台地。" },
     price: { manYen: 34.1, change10y: 36, note: "公示地価の近くの地点" },
-    features: { paddy: 0.5, forest: 0.15, town: 0.1, sand: 0, flood: 0.1, lowland: 0.7, river: 0.7, late: 0.35 },
+    features: { paddy: 0.5, forest: 0.15, town: 0.1, sand: 0, lowland: 0.7, river: 0.7, late: 0.35 },
   },
   {
     slug: "nishijin-4",
@@ -210,10 +206,9 @@ export const PLACES: Place[] = [
       { era: "1975", title: "町", text: "北の海が埋め立てられ始める。" },
       { era: "2026", title: "商店街と住宅", text: "商店街とマンション。大学のキャンパス跡が近い。" },
     ],
-    flood: { value: "想定なし", note: "川の浸水の想定区域の外。" },
     ground: { value: "海ぞいの砂丘", note: "締まった砂の上。地下水はやや深い。" },
     price: { manYen: 73.0, change10y: 52, note: "公示地価の近くの地点" },
-    features: { paddy: 0.05, forest: 0.1, town: 0.6, sand: 0.8, flood: 0, lowland: 0.2, river: 0.1, late: 0 },
+    features: { paddy: 0.05, forest: 0.1, town: 0.6, sand: 0.8, lowland: 0.2, river: 0.1, late: 0 },
   },
   {
     slug: "ropponmatsu-2",
@@ -222,7 +217,7 @@ export const PLACES: Place[] = [
     block: "2丁目",
     kana: "ろっぽんまつ",
     near: "地下鉄六本松駅の東 250m",
-    at: { lat: 33.5785, lon: 130.3800 },
+    at: { lat: 33.5785, lon: 130.38 },
     summary:
       "大正のころは丘の上の畑と、学校の広い敷地でした。昔から住宅が多い、水に浸かりにくい台地の上の土地です。",
     eras: [
@@ -231,10 +226,9 @@ export const PLACES: Place[] = [
       { era: "1975", title: "住宅地", text: "畑が消え、家とアパートが並ぶ。" },
       { era: "2026", title: "駅前の街", text: "校舎の跡が新しい街に。地下鉄で天神まで8分。" },
     ],
-    flood: { value: "想定なし", note: "川の浸水の想定区域の外。" },
     ground: { value: "古い砂と礫の台地", note: "締まった地盤。揺れは出にくい。" },
     price: { manYen: 61.5, change10y: 64, note: "公示地価の近くの地点" },
-    features: { paddy: 0.1, forest: 0.2, town: 0.4, sand: 0, flood: 0, lowland: 0.4, river: 0.2, late: 0.2 },
+    features: { paddy: 0.1, forest: 0.2, town: 0.4, sand: 0, lowland: 0.4, river: 0.2, late: 0.2 },
   },
   {
     slug: "nagaoka-3",
@@ -252,10 +246,9 @@ export const PLACES: Place[] = [
       { era: "1975", title: "丘の住宅地", text: "丘が削られ、段になった住宅地に。" },
       { era: "2026", title: "坂の住宅地", text: "坂の多い静かな住宅地。見晴らしが良い。" },
     ],
-    flood: { value: "想定なし", note: "川の浸水の想定区域の外。坂の下は土砂災害の区域に注意。" },
     ground: { value: "花崗岩の風化した丘", note: "切土の所は固い。盛土の所はやや弱い。" },
     price: { manYen: 21.3, change10y: 22, note: "公示地価の近くの地点" },
-    features: { paddy: 0.05, forest: 0.85, town: 0, sand: 0, flood: 0, lowland: 0, river: 0.1, late: 0.45 },
+    features: { paddy: 0.05, forest: 0.85, town: 0, sand: 0, lowland: 0, river: 0.1, late: 0.45 },
   },
   {
     slug: "hakozaki-1",
@@ -273,10 +266,9 @@ export const PLACES: Place[] = [
       { era: "1975", title: "町と埋め立て", text: "西の海が埋め立てられ、港の土地になる。" },
       { era: "2026", title: "古い町並み", text: "参道と古い家並み。駅の東は大学の跡地。" },
     ],
-    flood: { value: "0.5m未満", note: "宇美川があふれたときの想定（最大規模）。高潮の想定もある。" },
     ground: { value: "海ぞいの砂の高まり", note: "砂の上。まわりの低地よりやや高い。" },
     price: { manYen: 33.6, change10y: 33, note: "公示地価の近くの地点" },
-    features: { paddy: 0.1, forest: 0, town: 0.6, sand: 0.6, flood: 0.1, lowland: 0.4, river: 0.3, late: 0 },
+    features: { paddy: 0.1, forest: 0, town: 0.6, sand: 0.6, lowland: 0.4, river: 0.3, late: 0 },
   },
   {
     slug: "maizuru-2",
@@ -294,12 +286,16 @@ export const PLACES: Place[] = [
       { era: "1975", title: "ビルの町", text: "事務所のビルとマンションが建ち並ぶ。" },
       { era: "2026", title: "都心の街", text: "天神まで歩いて10分。ビルとマンション。" },
     ],
-    flood: { value: "0.5m未満", note: "那珂川があふれたときの想定（最大規模）。高潮の想定もある。" },
     ground: { value: "埋め立てと砂の低地", note: "江戸時代からの埋め立てを含む。" },
     price: { manYen: 112.0, change10y: 88, note: "公示地価の近くの地点" },
-    features: { paddy: 0, forest: 0, town: 0.95, sand: 0.3, flood: 0.1, lowland: 0.8, river: 0.4, late: 0 },
+    features: { paddy: 0, forest: 0, town: 0.95, sand: 0.3, lowland: 0.8, river: 0.4, late: 0 },
   },
 ];
+
+export const PLACES: Place[] = RAW_PLACES.map((p) => {
+  const flood = floodFor(p.slug);
+  return { ...p, flood, features: { ...p.features, flood: floodFeature(flood.depth) } };
+});
 
 export function placeBySlug(slug: string): Place | undefined {
   return PLACES.find((p) => p.slug === slug);
