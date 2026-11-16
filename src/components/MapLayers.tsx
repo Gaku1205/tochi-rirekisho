@@ -1,5 +1,6 @@
 // 地図の層を、中心とズームから並べる（動かない地図にも、動く地図にも使う）。
 import { project, type LatLon } from "@/lib/geo";
+import TileImg from "@/components/TileImg";
 import { tileUrl, type Layer, type TileLayer } from "@/lib/layers";
 
 export type Size = { w: number; h: number };
@@ -21,12 +22,9 @@ function Tiles({ layer, center, zoom, size }: { layer: TileLayer; center: LatLon
       const left = (x * 256 - c.x) * scale;
       const top = (y * 256 - c.y) * scale;
       imgs.push(
-        // eslint-disable-next-line @next/next/no-img-element
-        <img
+        <TileImg
           key={`${z}/${x}/${y}`}
           src={tileUrl(layer, z, x, y)}
-          alt=""
-          draggable={false}
           width={256}
           height={256}
           style={{
