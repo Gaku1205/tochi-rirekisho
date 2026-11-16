@@ -1,0 +1,546 @@
+# 開発の流れ（全自動パイプライン）
+
+人間がやるのは「何を作るか決める」ことだけ。あとはAIとGitHub Actionsが進め、人間の判断が要るときだけ止まって知らせる。
+
+```
+Issueを作る（メモ）。ラベルが無ければ自動で ai:plan が付く   intake.yml（見落としは watchdog.yml が拾う）
+  → 企画AIが清書して ai:implement を付ける        claude-plan.yml
+     （進行中の作業とぶつかると企画AIが判断したら ai:queue で順番待ち。別の場所なら最大2つまで並列）
+  → 実装AIがブランチに実装し、PRを自動で作る        claude-implement.yml
+  → CI（pipeline.json の checks。無ければ型チェック・リント・テスト・ビルド）   ci.yml
+  → main が進んでいたら取り込んでCIをやり直す         pipeline.yml
+  → 通ったらレビューAI（ai:review）                 pipeline.yml → claude-review.yml
+  → 指摘なし：自動でマージ → 公開（Vercel／App Runner／GitHub Releases／Expo）   pipeline.yml → deploy.yml
+     指摘あり／CI失敗：AIが直す（@claude、3回目は opus）→ CIから   pipeline.yml → claude-mention.yml
+  → 公開されたらスマホに通知                        deploy-notify.yml
+  → 順番待ち（ai:queue）があれば次を始める           queue.yml
+
+止まったときの自動再開
+  使用量の上限・AIのエラー・時間切れ → ai:retry を付けて、見張り役がやり直す（10回まで）   watchdog.yml
+  人間が ai:stuck を外す → 止まった所から続ける（直す回数もリセット）                              resume.yml
+```
+
+## ラベル
+
+| ラベル | 付けるのは | 意味 |
+| --- | --- | --- |
+| `ai:plan` | 受付（intake.yml）。人間が付けてもよい | 企画AIが清書して、実装に回す |
+| `ai:skip` | 人間 | まだ自動で動かさない。Issueを作るとき付けておく。外すと企画に回る（人間の下準備が先に要る物用） |
+| `ai:implement` | 人間か企画AI | 実装AIが作業を始める |
+| `size:S` / `size:L` | 人間か企画AI | 実装AIのモデルと作業回数の上限を変える（S：haiku・40回、無印：sonnet・60回、L：opus・100回） |
+| `ai:review` | パイプライン（人間も可） | レビューAIが確認する |
+| `ai:queue` | 企画AI（進行中の作業とぶつかると判断したとき）か人間 | 順番待ち。前のPRが自動でマージされ、実装中の物・openのPRが無くなったら（企画の段階で止まった物は待たない）、番号の小さい順に実装が始まる。まとめて頼んで寝ておける |
+| `ai:blocked` | 企画AI（`BLOCKED`） | 他の Issue・PR の完了待ち（その結果や決まりを使う作業。別のリポジトリの作業でもよい）。待ち先はコメントの印 `<!-- blocked-by: owner/repo#N -->`（待ち先ごとに1つ）。見張り役が待ち先を見て、全部閉じたら（マージ・クローズ）`ai:blocked` を外して `ai:plan` に戻す。人間は何もしなくてよい（下の「他の Issue・PR の完了待ち」） |
+| `ai:found` | 使ってみる役・監査役（`found-report.sh`） | 使ってみる役（公開後に本番を試す）・監査役（仕様書の食い違いを探す）が見つけて作った Issue の印。`ai:plan` も一緒に付き、いつもの流れに乗る（下の「使ってみる役・監査役」） |
+| `priority:high` | 人間 | 急ぎ。順番待ち（`ai:queue`）から先に実装に回す（下の「順番待ちの進め方」） |
+| `ai:hold` | 人間か進行役 | 最後のマージだけ人間が押す（大事な変更用）。`.github/`・`docs/pipeline.md`・`CLAUDE.md`・`AGENTS.md` を触るPRには、進行役が自動で付ける（ただし ai-dev-template 自身は、スクリプト・テスト・`docs/pipeline.md` だけの変更なら付けず、自動でマージする。下の「安全のしくみ」） |
+| `ai:retry` | パイプライン | AIが一時的に止まった（使用量の上限など）。見張り役が30分以上あけて自動でやり直す（失敗のコメントに、原因の分類とログのURLが付く）。人間は何もしなくてよい |
+| `ai:stuck` | パイプライン | 自動で進められず止まった。人間が確認して、続けるなら外す（外すと自動で再開） |
+| `ai:question` | 企画AI・画面案 | 結果が大きく変わる迷い（見た目の方向・画面の構成・挙動・お金・データ・範囲）を、選択式で質問して待っている（コメントの印 `<!-- ai-question -->`）。オーナーがコメントで答えると `answer.yml` が `ai:plan` に戻し、企画AIが答えを使って清書する。小さい迷いは聞かずに「仮定」に書く |
+| `ai:mocks` | 企画AI | 見た目の大きい作り直し・新しい画面の作業。作る前に `claude-mocks.yml` が、今の画面とデザイン仕様を見てざっくり画面を2案作り（1枚の HTML。画像と HTML は `ai-mocks` ブランチ）、選択肢と質問を書いて `ai:question` で待つ。答えると、企画AIが選んだ画面を「目標の画面」（本文の印 `<!-- ai-mock: … -->`）として清書し、実装AIはそれを `.shots/target/` に受け取って合わせて作る |
+| `visual:update` | 進行役（見た目のテストだけが落ち、PRに「見た目を変えた」と書いてあるとき。修正AIが変更なしで終わり、AIの返事・レビューの指摘・PRの説明に撮り直しの依頼があるとき）か人間 | 見た目のテストの基準の画像を、CIの環境で全部撮り直してPRにコミットする（差が閾値の中で通っていた画像も撮り直すので、古い見た目の画像が残らない。終わると外れる） |
+
+見張り役は、ありえないラベルの組み合わせ（`ai:queue` と `ai:implement`、`ai:plan` と `ai:implement`、記録の無い `ai:retry`、直近7日に閉じた物に残った `ai:stuck`・`ai:retry`・`ai:queue`・`ai:blocked`）を直し、その Issue・PR に1行コメントする（1回に20件まで）。
+
+## 人間に回る（止まる）とき
+
+- 企画AIが「人間にしかできない作業」が要ると判断した（依存パッケージの追加、`.github/`・`docs/pipeline.md`・CLAUDE.md の変更、秘密情報の登録、外部サービスの設定。Issueに、してほしいことが書かれる。そのコメントの1行目は `<!-- human-request -->`、2行目が要点の1文で、agent-desk の「あなたの番」にはこの1文が出る）。意図が読み取れないだけなら止まらず、AIが無難に仮決めして「### 仮定」に書く。大きすぎるときは、最初の分だけをこのIssueにして、残りは新しいIssueとして自動で作る
+- 実装AIが正常に終わったのに、変更を残さなかった（拒否された操作が無いとき。コメントに、AIが最後に言ったことが書かれる。拒否があったときは、下の「自動でやり直す」）
+- `ai:blocked` の待ち先を、60分たっても読めない（別のリポジトリが非公開で、パイプラインの鍵では読めない、など）
+- CIの失敗とレビューの指摘を合わせて、AIが3回直しても解決しない（2回は普通のモデル、最後の1回はいちばん強いモデル opus で直す）
+- 直すよう頼んだのに、AIが変更を入れなかった（指摘が誤りだと判断した、など）
+- レビューAIがエラーで止まった
+- `ai:hold` のPRで、CIもレビューもOKになった
+
+止まったら `ai:stuck` が付き、スマホに通知が来る。確認して、続けるなら `ai:stuck` を外す。外すと resume.yml が、そのときのCIの状態から自動で続ける（通っていればレビューへ、落ちていればAIが直す。AIに直させる回数もリセットされる）。自分で直す・マージする・閉じるときは、外さなくてよい。
+
+## 自動でやり直す（人間に回さない）とき
+
+次は一時的な失敗かもしれないので、すぐ人間に回さず `ai:retry` を付ける。見張り役（watchdog.yml）が、失敗から30分以上あけてやり直す。見張り役は、定期の起動（GitHubの都合で数時間あくことがある）に加えて、AIやCIのワークフローが終わるたびにも動く。さらに、待ちが明ける時刻に目覚まし（retry-timer.yml）をかけておき、その時刻に自分を起こす（使用量の上限のリセットを待っているときも、定期の起動の遅れに左右されない）。10回やり直しても直らなければ `ai:stuck` で人間に回す。
+
+使用量の上限が原因と分かったとき（企画AI・実装AIの実行記録に「usage limit」などが出ているとき）は、回数を使わずに待つ。リセット時刻が読めれば、その1分後にやり直す。読めなければ60分あけてやり直す。待ちに入った最初の1回だけ、スマホに「使用量の上限で待っています」と通知する（通知の種類 `limit`）。上限が24時間以上続いたら、本物のエラーと同じに数えて、10回で `ai:stuck` にする。レビューAI・修正AIは、実行記録をこの段階では読めないので、これまでどおり30分あけて、回数に数える。
+
+- 実装AIが正常に終わったのに変更を残さず、実行記録に「拒否された操作」がある：拒否された操作と、AIが最後に言ったことをコメントに書き（これが、やり直す実装AIへの手がかりになる）、`ai:implement` を付け直して1回だけやり直す（`<!-- auto-perm-retry -->`。`open-pr.sh`）。やり直しても同じなら、足りない許可を書いて人間に回す。人間が `ai:stuck` を外して再開すると、また1回やり直せる
+- 企画AIが「他の Issue・PR が終わらないと始められない」と判断した（`BLOCKED`）：人間に頼まず `ai:blocked` で待ち、待ち先が全部閉じたら見張り役が `ai:plan` に戻す
+- 企画AI・実装AI・レビューAI・修正AIが、エラーで終わった。ただし、`ai:plan` が付け直されて新しい実行に置き換わった（取り消された）企画は、失敗として扱わない。企画のやり直し待ち（`ai:retry`）の Issue が、もう先へ進んでいれば（`ai:implement`・`ai:queue`・`ai:question`・`ai:mocks`・`ai:blocked`）、見張り役は印を外すだけでやり直さない（使用量の上限に当たったときなど。リセットされるまで待ちながらやり直す）
+- 実装AIが時間切れなどで終わり、失敗の知らせも無いまま45分以上動きが無い
+- レビューAIの結果が出ないまま30分以上たった
+- パイプライン自体の確認（スクリプトのテスト・shellcheck）だけが落ちて、PRが `.github/` を触っていない：原因はPRの変更ではなく、AIは `.github/` を直せないので、AIに頼まない。落ちたジョブを1回だけやり直し（実行環境の入れ替わりなどの一時的な揺れ）、それでも落ちたら人間に回す（`ai:stuck`。テンプレートの側で確かめる）
+- mainが進んでPRのブランチに取り込めない（コンフリクト）：AIに解消させる（直す回数に数える）。画像など中身を混ぜられないファイルは、AIが `git checkout --theirs -- パス`（main の側）か `--ours` で片方を取る。見た目のテストの基準の画像は main の側を取り、そのあと `visual:update` で撮り直す。CIのあと、レビューの間に別のPRが先にマージされ、マージの時点でコンフリクトになったときも同じ（`merge_or_handle`）。コンフリクト以外の理由でマージできなかったときは、やり直し待ち（`ai:retry`）にする（黙って止まらない）。PRの先頭に CI が1つも動いていないままコンフリクトしているとき（コンフリクトがあると GitHub は CI を動かさないので、CI のあとの処理も呼ばれない。例：基準の画像の撮り直しを push している間に、別のPRが main に入った）は、見張り役が見つけて同じようにAIに解消させる（同じ先頭には1回だけ。配布のPRは除く）
+- CIが「承認待ち」で止まった（空のコミットを足してCIを動かし直す）
+- `visual:update` が付いたまま10分たっても、撮り直しが動いていない（見張り役）：ラベルを外し、main とコンフリクトしていればAIに解消させる（直す回数に数える）。コンフリクトが無ければ1回だけ付け直し、それでも動かなければ人間に回す
+- レビューAIが、結果のコメント（`## Code review`）を書いたあとにエラーで終わった：書けた結果で進める（やり直すと30分待ったうえ、同じレビューをもう一度するため）。結果が書けていなければ、今までどおりやり直し
+- レビューAIが、エラーにならずに結果のコメントを書かずに終わった（一時的な不調）。2回までは自動でやり直し（`ai:retry`）、続くなら人間に回す
+- 見た目のテストだけが落ちていて、PRに「見た目を変えた（`visual:update`）」と書いてある（意図した変更なので、AIに直させず `visual:update` を付けて基準の画像を撮り直す。main を最後に取り込んだ後で2回まで（取り込むと基準の画像は main の側に戻るので、それより前の撮り直しは数えない。人間が `ai:stuck` を外して続きを頼んだ後も数え直す。`visual_update_count`）。意図していない崩れは、AIに直させる）。AIに直させるときは、落ちたCIの差分の画像（`visual-diff`）を先に取ってきて見せる（`fetch-visual-diff.sh`）。AIは画像を見て、頼まれた変更なら `visual:update` を頼み、崩れならコードを直す。修正AIがコードを変えずに終わり、AIの返事・この先頭コミットへのレビューの指摘・PRの説明のどれかに撮り直しの依頼（`visual:update`、「基準の画像が古い」など）があるときも、進行役が `visual:update` を付けて撮り直す（CIが通っていて、レビューだけが指摘したときも。同じ数え方で2回まで、3回目は人間に回す。見た目のテスト以外のチェックも落ちていれば、撮り直しでは直らないので人間に回す）。撮り直しのコミットが入ると、CI とレビューが最初から走り直す（レビューのあとの処理は、先頭コミットより後のレビュー結果だけを見るので、古い画像へのレビューは引きずらない）。撮り直した画像はPRに入るので、レビューAIは前（PRの元）と後（PRの先頭）の画像を開いて見比べ、Issueどおりの変化か・崩れが無いかを確かめる（`claude-review.yml` の「見た目の画像の前と後を用意する」。1回に12組まで）。基準の画像はCIの環境で撮るので、同じ環境なら毎回同じ絵になる。見た目のテストの閾値（Playwright の `maxDiffPixelRatio` など）は小さくしておく（大きいと、小さい見た目の変更が通ってしまい、古い基準の画像が残る）
+
+修正AI（`@claude 直して`）が正常に終わったのに変更が無いときは、`after-mention.sh` が理由を分けて動く（`classify_no_change`。AIの返事のキーワード・レビューの指摘・PRの説明・実行記録を、上から順に見る）：
+- **人間のラベル作業が要る**（基準の画像の撮り直し）：上のとおり、進行役が `visual:update` を付ける（2回まで）。ただし、main とのコンフリクトが残っているPRでは付けない（コンフリクトがあると、GitHub は撮り直しもCIも動かさないので、付けても何も起きない）。拒否された操作があれば、解消のしかた（`git checkout --theirs -- パス`）を書いて1回だけ出し直し、無ければ理由を書いて人間に回す
+- **ツールの許可が拒否された**（実行記録の拒否、または AIが「許可されていない」と報告）：拒否された操作をそのままの形でコメントに書き、同じ依頼を1回だけ出し直す（`<!-- auto-perm-retry -->`。直す回数には数えない。人間が `ai:stuck` を外して再開すると、また1回やり直せる）。2回目も拒否されたら、足りない許可の候補を書いて人間に回す（`ai:stuck`。同じ不足が2回で、直すためのIssueを自動で作る）
+- **指摘が間違いと返した**（「指摘は誤り」「直す必要はない」など。理由はAIのコメントに残る）：`ai:review` を付け直して、もう一度レビューに回す。同じ指摘が続けば、レビューのたびに直す依頼が数えられ、直す回数の上限で人間に回る。CIが落ちたままなら先へ進めないので人間に回す
+- **分類できない**（質問した、など）：今までどおり、やり直さず人間に回す（`ai:stuck`）
+
+## 安全のしくみ
+- **閉じた Issue では進めない**：企画・実装・画面案は、開いている Issue でだけ始まる。作業中に Issue が閉じられたら、企画のあと（`after-plan.sh`）は清書の結果を使わず、実装のあと（`open-pr.sh`）はPRを作らない（閉じた Issue の企画の結果で実装が始まり、同じ作業のPRがもう1つできたことがある）
+- レビューAIは、画面のファイルが変わったPRでは web-design-guidelines（`.claude/skills/web-design-guidelines/guidelines.md`）も当て、使う人が実際に困る物（キーボードで操作できない・フォーカスが見えない・ラベルが無い・`prefers-reduced-motion` を無視・ズームの禁止・長い文字や空で崩れる・取り消せない削除など）だけを指摘する。`docs/design.md` が決めていることは、そちらが正しい
+- レビューAIは普段 sonnet。追加＋削除が300行を超える変更と、ログイン・トークン・秘密・権限・依存（`package.json`）・ワークフローを触る変更は opus でレビューする（`claude-review.yml` の「レビューのモデルを決める」）
+- AIが動くジョブには `PIPELINE_TOKEN` を渡さない。企画・実装のあとの処理（次へ進める・PRを作る）は別のジョブで、main から取り直したスクリプトを動かす。AIが作業フォルダのスクリプトを書き換えても、強いトークンでは動かない（AIの結果は、実行記録と `plan-result.txt` をデータとして受け渡すだけ）
+- パイプラインの更新を配る（`sync.yml`）のは、テンプレートの main でCIが通った版だけ。CIが通ってから15分待ち（変数 `SYNC_DELAY_MIN` で変えられる。手で動かしたときは待たない）、その間に main がまた更新されたら新しい方だけを配る（続けてマージしても、配り先のPRは1つで済む）。配り先は、このテンプレートから作られ、パイプラインの鍵（App）が見えるリポジトリ（自動。新しいアプリを作っても書き足さなくてよい）と、`.github/sync-targets` に書いた物（テンプレートより前からあるリポジトリなど）。配りたくない物は `.github/sync-targets` に `!owner/repo` と書く（`sync-targets.sh`）。配るときは配り先の `.github/` をテンプレートの物で置き換える（テンプレートに無いファイルは消える）。配り先で自分で足したワークフローなどを残したいときは、配り先の `.github/sync-keep` に、そのファイルの名前を1行に1つ書く（例：`workflows/my-job.yml`）。配り先の main には直接入れず、`pipeline-sync/<sha>` のPRを作る。配り先のCIが通ったら、進行役がレビューなしでマージする（落ちたら `ai:stuck` で人間に回す。AIが作ったPRや、印の無いPRはこの扱いにしない）
+- `.github/`・`docs/pipeline.md`・CLAUDE.md・AGENTS.md・`pipeline.json` を変えるPRは、CIとレビューが通っても自動でマージしない（マージを人間に任せて通知する）。仕組みそのものが、AIの判断だけで書き換わらないようにするため。普通のIssueは今までどおり全自動
+- 合否を決めるのはCI。AIの「できました」は信じない
+- 進行役（pipeline.yml）は `workflow_run` で main にある版が動くので、PRの中身で判断を書き換えられない
+- AIは `.github/`・`docs/pipeline.md`・`CLAUDE.md`・依存パッケージを触らない。`docs/spec.md`・`docs/design.md` は、見た目や挙動を決めるIssueのとき、実装の前に更新して同じPRに入れる（CLAUDE.md）。レビューAIが、書いた内容がIssueの範囲かを見る
+- レビューAIは毎回、前の指摘が直ったかも含めて見直し、必ず「## Code review」で始まるまとめを残す（進行役はこれで判断する）
+- 自動の修正は3回まで（最後の1回は opus）、自動のやり直しは10回まで。無限に回らない
+- AI（claude[bot]）のpushでCIが「承認待ち」になったら、進行役がオーナーのトークンで空のコミットを足してCIを動かし直す
+- ai-dev-template 自身は、AIがスクリプト・テスト・`docs/pipeline.md` を直し、CI（`script-tests`・`shellcheck`）とレビューが通れば自動でマージされる。印は main の `CLAUDE.md` の `pipeline-self-edit: auto` で、進行役は main の物を見るので、PRで印を足してもすり抜けられない。ワークフロー・`CLAUDE.md`・`AGENTS.md`（AIの許可とルール）は、どのリポジトリでもAIが無人で書き換えない（人間側のClaudeが行い、マージは `ai:hold`）
+- 公開後に壊れていたら、Vercelの画面から前の版にすぐ戻せる
+
+## 読む量を減らす（Issue の「読む所」）
+
+仕様書（`docs/spec.md`）とデザイン仕様（`docs/design.md`）は、Issueのたびに増える。AIが毎回全部を読むと、使用量の上限に早く当たる。そこで、いちど全部を読む企画AIが、清書のときに Issue の本文に `### 読む所` を書く（ファイルごとに、関係する節の見出し。見た目に触る作業なら、デザイン仕様の全体に効く決まりの節も。関係するコードのファイルも）。
+
+- 実装AI・修正AIは、「読む所」があれば、仕様書を最初から全部は読まず、Grep で見出しを探して、その節だけを Read で読む。足りなければ追加で読む。「読む所」が無い Issue では、今までどおり全部読む
+- 行番号は書かない（順番待ちの間に、ほかの作業で変わるため）。仕様書が無い・短い（200行より短い）リポジトリでは、企画AIは「読む所」を書かない
+- レビューAIは変えない（必要な所を自分で読む）
+- 効いているかは、`ai-report.sh` が実行ごとに出す「使った量」（入力・キャッシュから・出力のトークン）で比べる
+
+## 指示を部品で組む（`compose-prompt.sh`）
+
+実装AI・修正AI（mention）に渡す指示（`--append-system-prompt`）は、部品に分けて `.github/scripts/prompts/` に1ファイル1部品で置く。`.github/scripts/compose-prompt.sh` が、要る部品だけを順に連結して標準出力に出す。見た目のテストが無いリポジトリに基準画像の注意を読ませない、などで読む量とぶれを減らす。企画AI・レビューAIの指示は対象外。
+
+| 部品 | 中身 | 入れるとき |
+|---|---|---|
+| `base.md` | コマンドは1つずつ・Read/Grep/Glob を使う・`.github/` は変えない | いつも |
+| `read-sections.md` | Issue の「読む所」の節だけ読む | `--docs`（`docs/spec.md` が200行以上） |
+| `merge-main.md` | push の前に main を取り込む・コンフリクトの解消 | いつも |
+| `visual-tests.md` | 基準画像の扱い・`visual:update` ラベル・`test:visual` の動かし方 | `--visual-tests` |
+| `visual-diff.md` | `.visual-diff/` の見方 | mention かつ `--visual-tests` |
+| `pr-body.md` | PR の本文の直し方（`.pr-body.md`） | mention |
+
+- 使い方：`bash .github/scripts/compose-prompt.sh --mode implement|mention [--visual-tests] [--docs]`。`--auto` を付けると、作業フォルダから自分で判定する（見た目のテスト＝`package.json` の `test:visual` か `pipeline.json` の `checks` にある。長い仕様書＝`docs/spec.md` が200行以上。企画AIの「短い」と同じ基準）
+- 部品の文は、元のワークフローの指示をそのまま分けたもの（意味は変えない）。出し分けは mode と、リポジトリの条件だけ（Issue の種類では出し分けない）
+- 選び方は `tests/test-compose-prompt.sh` で確かめる
+- ワークフローは、AIを呼ぶ前の「AIへの指示を組む」の手順（`id: prompt`）でスクリプトを動かし、改行と `"` を除いた1行を `steps.prompt.outputs.text` に出して、`--append-system-prompt \"${{ steps.prompt.outputs.text }}…\"` で渡す（`claude_args` の中では `$(...)` が動かないため）。`claude-implement.yml` は Issue がきっかけで作業フォルダが main なので、そのまま `.github/scripts/compose-prompt.sh --mode implement --auto`。実装AIと審査後の直し役の2か所で同じ指示を使い、末尾の `${{ steps.shots.outputs.prompt }}${{ steps.target.outputs.prompt }}` は後ろに残す。`claude-mention.yml` は作業フォルダがPRの中身なので、`compose-prompt.sh` と `prompts/` を main の版から取ってきて（「道具を main から取ってくる」）`--mode mention --auto` で動かす（判定は作業フォルダで行う）
+
+## AIの許可（`--allowedTools`）
+
+各AIが使ってよい操作は、ワークフローの `--allowedTools` に書いてある。AIは、ここに無い操作をしようとすると拒否されて止まる。次の表が一覧（`.github/scripts/tests/test-permissions.sh` が、ワークフローと表が食い違っていないか確かめる）。
+
+| AI（ワークフロー） | 許可している操作 | 許可していない操作と理由 |
+| --- | --- | --- |
+| 企画AI（`claude-plan.yml`） | `Bash(gh issue view:*)`、`Bash(gh issue edit:*)`、`Bash(gh issue comment:*)`、`Bash(gh issue create:*)`、`Bash(gh issue list:*)`、`Bash(gh pr list:*)`、`Bash(gh pr diff:*)`、`Read`、`Glob`、`Grep`、`Write` | コードを変えるgit操作・npm（企画はIssueを書くだけ。`Write` は結果ファイル `plan-result.txt` のため） |
+| 画面案（`claude-mocks.yml`） | `Read`、`Write`、`Edit`、`Glob`、`Grep`、`WebSearch`、`WebFetch`、`Bash(node .github/scripts/shot.mjs:*)`、`Bash(node .claude/skills/taste-skill/scripts/draw.mjs:*)`、`Bash(node .claude/skills/taste-skill/scripts/lint.mjs:*)`、`Bash(node .claude/skills/taste-skill/scripts/inspect.mjs:*)`、`Bash(node .claude/skills/taste-skill/scripts/assets.mjs:*)` | git・gh・npm（今の画面とデザイン仕様を見て、設計メモを書き、実例と本物の素材を探して、`mocks/` にざっくり画面の HTML を書いて撮って測るだけ。Issue は前のステップが `mocks/issue.txt` に書いておく。鍵は持たない。同じジョブの審査役は `Read`・`Glob`・`Write` だけで、画像を見て `.judge/verdict.json` を書く。直す役は作る役と同じ許可） |
+| 使ってみる役（`claude-try.yml`） | `Read`、`Write`、`Glob`、`Grep`、`Bash(node .github/scripts/shot.mjs:*)` | git・gh・npm（本番のサイトを撮って試し、見つけた問題を `.try/result.json` に書くだけ。Issue は鍵を持つ別のジョブが作る） |
+| 監査役（`claude-audit.yml`） | `Read`、`Write`、`Glob`、`Grep` | コマンドは全部（仕様書とコードを読んで、食い違いを `.audit/result.json` に書くだけ。Issue は鍵を持つ別のジョブが作る） |
+| 実装AI（`claude-implement.yml`） | pipeline.json の checks のコマンド（無ければ npm run typecheck・lint・test・build。下の「言語と公開先」）、`Bash(.github/scripts/tests/run-all.sh)`、`Bash(git status:*)`、`Bash(git diff:*)`、`Bash(git add:*)`、`Bash(git commit:*)`、`Bash(git fetch:*)`、`Bash(git merge:*)`、`Bash(git checkout --ours:*)`、`Bash(git checkout --theirs:*)`、`Bash(git push:*)`、`Bash(bash .github/scripts/tests/run-all.sh)`、`Bash(shellcheck:*)`、見た目のテストがあるアプリでは `Bash(npm run test:visual)`・`Bash(npm run test:visual -- -g:*)`・`Bash(npx playwright test:*)`（手元で動かして、位置や数値を確かめるため。基準の画像の撮り直し（--update-snapshots・-u）は許さない）、画面のあるアプリでは `Bash(npm run build)`・`Bash(node .github/scripts/shot.mjs:*)`・`Bash(.github/scripts/fetch-photos.sh:*)`（作った画面を本物のブラウザで 390・1440・1920 の幅で撮り、画像を見て直すため。下の「撮って見て直す」）、`Skill`（.claude/skills/ のスキル。画面を作るときの frontend-design・taste-skill・web-design-guidelines、GSAP・Lenis が入っているアプリでの motion-gsap-lenis。taste-skill のスクリプトは、測る inspect.mjs だけ動かしてよい） | `gh`（PRやコメントは進行役が作る）、`npm run readme:shots` などの重い物（README の撮影はCIのワークフローでやる）。ファイルの編集は、このツールの標準で許可される。gitは、標準に任せると拒否されて止まったことがあるので、明示して許可している。`git push --force`・`git rebase` は許可しない |
+| レビューAI（`claude-review.yml`） | `Bash(gh pr view:*)`、`Bash(gh pr diff:*)`、`Bash(gh issue view:*)`、`Bash(gh pr comment:*)`、`Read`、`Glob`、`Grep`、`Write`、`mcp__github_inline_comment__create_inline_comment` | コードの変更・git操作・npm（レビューは読むだけ。コードは直さない） |
+| 修正AI（`claude-mention.yml`） | `Bash(gh pr view:*)`、`Bash(gh pr edit:*)`、`Bash(gh issue view:*)`、`Bash(gh pr comment:*)`、`Bash(git fetch:*)`、`Bash(git merge:*)`、`Bash(git checkout --ours:*)`、`Bash(git checkout --theirs:*)`、`Bash(git status:*)`、`Bash(git diff:*)`、`Bash(git add:*)`、`Bash(git commit:*)`、`Bash(git push:*)`、pipeline.json の checks のコマンド（無ければ npm run typecheck・lint・test・build）、`Bash(.github/scripts/tests/run-all.sh)`、`Bash(bash .github/scripts/tests/run-all.sh)`、`Bash(shellcheck:*)`、見た目のテストがあるアプリでは `Bash(npm run test:visual)`・`Bash(npm run test:visual -- -g:*)`・`Bash(npx playwright test:*)`（基準の画像の撮り直しは許さない）、`Skill` | `git rebase`・`git push --force`（履歴を書き換えない）、`gh pr merge`（マージは進行役だけ）。`gh pr edit` はPRの説明の直し（本文はファイルに書いて `--body-file` で渡す）、`gh issue view` はIssueを読むため、`git merge` はコンフリクトの解消のために許可している |
+
+**ボットが作ったPRでは、許可していても拒否されるコマンドがある**（`claude-code-action` の `restrict_untrusted_prs`。既定で有効）。PRの作者に書き込み権限が確認できないとき、パッケージマネージャー・テスト・インタプリタ・シェルなど「PRのコードを動かすコマンド」（`npm`・`npx`・`node`・`bash` など）は、`--allowedTools` に入っていても拒否される。ボットは、`allowed_bots` に入っていても必ずこの扱いになる。このパイプラインのPRは、パイプラインの App（ボット）が作るので、何もしないと修正AIは確認コマンドを1つも動かせない（「npm が許可されなかった」と報告して、確かめないまま push する）。
+
+そこで `claude-mention.yml` は、AIの前に `.github/scripts/pr-trust.sh` で次を全部確かめ、満たすときだけ `restrict_untrusted_prs: false` にする。それ以外のPR（fork・`claude/` ではないブランチ・閉じたPR・読めないとき）は、既定のまま拒否させる。
+
+- PRのブランチが、このリポジトリの中にある（fork ではない。このリポジトリに push できるのは、書き込み権限のある人と App だけ）
+- ブランチ名が `claude/` で始まる（実装AIが、このリポジトリのワークフローの中で作ったブランチ）
+- PRが開いている
+
+AIのアクションは作業フォルダをPRのブランチに切り替えるので、AIのあとの工程は、作業フォルダのスクリプトを動かさない（AIの前に、main の版を API で `$RUNNER_TEMP/pipeline-tools/` に取ってきて、それを動かす。`pr-trust.sh` も同じ（PRが書き換えた版に判断させない）。`tests/test-workflows.sh` が確かめる）。実装AI・企画AIは Issue で動くので、この拒否は掛からない。レビューAIは `gh` と読むだけなので影響しない。
+
+許可が足りなくて止まったときは、次のようになる。
+
+- 企画AI・実装AIがエラーで終わったときは、実行記録から拒否された操作を読み取り、「足りない許可：`Bash(git merge:*)`」のように、通知とコメントに書いて人間に回す（やり直しても直らないので、自動のやり直しはしない）。実装AIが正常に終わったのに変更が無いときは、拒否された操作を手がかりに書いて1回だけやり直す（上の「自動でやり直す」）
+- 修正AIは、AIのコメントに「許可されていない」などと書かれていれば、その行と、出てくるコマンドから足りない許可の候補を書いて人間に回す
+- 同じ許可の不足が2回起きたら、直すためのIssue（`AIの許可が足りない：…`）を自動で作る（`ai:skip` 付き。マネージャーが `--allowedTools` と上の表を直す）。回数の記録は、閉じたままの「AIの許可の不足（自動の記録）」Issueのコメントに残る
+
+### 撮って見て直す
+
+文字だけで画面を作ると、行をまたいで揃うはずの列のずれ・重なり・何も無い帯・弱い主役に、誰も気づけない（工場で作った最初の2つのサービスで起きた）。そこで、画面を作るAIは**自分で撮って見る**。
+
+- 撮るのは `.github/scripts/shot.mjs`（依存なし。Chrome の操作は `.github/scripts/lib/cdp.mjs`（taste-skill から写した物、MIT）で、ubuntu-latest に入っている Chrome で撮る。Node 22 以上）。`--serve` でビルド済みのアプリを立ち上げてパス（`/` など）を撮るか、URL（実在のサイト）か HTML のファイルを撮る。幅は 390・1440・1920。`--scrolls N` で1画面ずつスクロールしながら N 枚撮る（スクロールで出てくる物・動きの途中が見える）。`--scale 2 --format webp` でサイトに載せる用の高精細で軽い画像にする。`--links` でページにあるリンクを出す（ギャラリーの一覧から、載っているサイトを拾う）。押す・入力する・localStorage にデータを入れるなどの操作をしてから撮る場面は `--steps` の JSON で書く（使い方はファイルの先頭）
+- **実装AI**（`claude-implement.yml`）：画面のあるアプリ（package.json に `start` がある Node のアプリ）では、確認コマンドが通ったあと `npm run build` → `node .github/scripts/shot.mjs --serve /` で撮り、画像を全部見て、`docs/design-ref/` の目標の絵があれば見比べ、目立つ問題の上位3つを直して撮り直す（最大3回）。撮った画像は `.shots/` にでき、コミットされない（`.git/info/exclude`）。そのあと、**別のAI（審査役）**が、ワークフローが撮り直した画像（下へスクロールした続きも）と目標の絵だけを見て答え（コードは見ない）、合格（下の「デザインの仕組み」。今あるアプリへの変更は、足した所が `docs/design.md` の「このサービスらしさ」に沿っているか・崩れ・スマホ・足した所の型と地味さ）に届かなければ、指摘をつけて実装AIにもう1回だけ直させる。結果はPRの本文に入る。そのぶん時間の上限を 75 分にしている
+- **デザイン担当**（工場）：実在の良いサイトを撮って参考にしてから、本物の画面を作り、撮って実例と見比べて直す（下の「工場」）
+
+## デザインの仕組み（考え → 関門 → 審査）
+
+禁止の決まりを足し続けると、画面は無難で地味になる（11月2日）。決まりを外すと、AIの平均になる（11月16日。クリーム色に朱・等幅の数字・罫線だらけ、白い角丸の箱にインディゴ）。どちらも、**その題材にしか無い物が画面に無い**のが原因で、それを作ったAI自身は見抜けない。そこで、見た目を作る所は全部、次の3つを通す。特定の系統（雑誌風・ミニマルなど）には寄せない。どの系統でも、題材だけの考えが絵に出ていて、やり切っていれば通る。
+
+| 段 | 誰が | 何をするか | どこに書いてあるか |
+| --- | --- | --- | --- |
+| 1. 考え | 作るAI（Opus） | 色や文字を選ぶ前に、**設計メモ**（`concept.md`）を書く：題材の持ち物を 8〜12 個 → 考え（「この画面では、〇〇が〇〇になる」。競合の名前に入れ替えて成り立つなら捨てる）→ 埋める物（大きい文字・色の面・本物の素材・中身）→ 通し表（全部の欄・全部の画面で、考えがどう出るか）。組み方（色・文字・構図）は taste-skill の `draw.mjs` に配ってもらい、考えを運べる物を選ぶ。本物の写真・古い地図・図版は `assets.mjs`・`fetch-photos.sh` で取る | `.github/factory/concept.md` |
+| 2. 関門 | スクリプト（AIではない） | 機械で測れる事を測る：設計メモの形（持ち物8個以上・考えの1文・通し表3行以上）、**本物の絵の枚数**（出どころの記録がある画像だけを数える。ページは相談で3枚・本物の画面で4枚以上。道具の画面は問わない）、`lint.mjs` の FAIL（今ある見た目への追加は `docs/design.md` が上なので見ない） | `.github/scripts/design-judge.py gate`・`design-review.sh prepare` |
+| 3. 審査 | 審査役（作ったAIとは別の Opus。読む・書くだけ、40 手まで） | **画像だけ**を見て（下へスクロールした続き・スマホ・実在のサイトの画像と並べて）、「はい・いいえ」の問いに答え、点（見た目 40%・使いやすさ 30%・考え 20%・中身 10%）と直し方を書く。コードも HTML も見ない。直し方は「消す」だけでなく「何で埋めるか」まで書く | `.github/factory/judge.md` |
+
+**合格はスクリプトが決める**（`design-judge.py verdict`。AIに自分で合格と言わせない）：必ず通す問いが全部「はい」で、点が 7.5 以上で、関門が通っていること。
+
+- 必ず通す問い：この題材だけの考えがある（`swap`）／本物の素材が主役の位置にある（`real`）／考えが下の欄・ほかの画面まで通っている（`through`）／地味でない（`full`）／AIの型が見えない（`tells`）／崩れが無い（`broken`）／オーナーが決めた事が絵に出ている（`owner`）。今あるアプリへの変更では、足した所が「このサービスらしさ」に沿っている（`fits`）
+- 点の上限だけの問い：1秒で主役が1つ見える／同じ構図が続いていない（審査役が書いた構図の言葉が続いていれば、答えにかかわらず「いいえ」）／スマホで成立／実例の隣で見劣りしない
+- 「いいえ」は、その欄の点に上限を掛ける（taste-skill の `references/critique.md` の上限を土台にした）。答えていない問いは「いいえ」。審査役が結果を書かなかったときは、合格とも不合格とも言わず「審査できなかった」と見せる
+- 届かなければ、指摘の紙（`.judge/fix.md`）を作ったAIに渡して**1回だけ**直させ、もう一度審査する（審査は最大2回）。それでも届かなければ、止めずに、点と残った指摘を付けてオーナーに見せる（選ぶのはオーナー。完全に止めると、全自動でなくなる）
+
+どこで動くか：
+
+| 場面 | 作る役 | 審査する物 | 種類 |
+| --- | --- | --- | --- |
+| 工場の相談「見た目の方向」（`factory-talk.yml`） | 相談役（Opus・150 手。直しは 80 手） | 3つの板の「最初の1画面」。3つが色違いでなく、考えから違うか（`distinct`） | looks |
+| 工場の相談「ざっくり画面」 | 同じ | 2案を、PC は4画面ぶん・スマホは3画面ぶん下まで | screen |
+| 工場のデザイン担当（`factory.yml`。ゲームは対象外） | デザイン担当（Opus・250 手。直しは 100 手） | できた本物の画面（最初のページを下まで、ほかのページ、スマホ）。直して確認コマンドが通らなくなったら、直す前の物に戻す | screen |
+| 既存アプリの画面案（`claude-mocks.yml`） | 画面案のAI（Opus・150 手。直しは 80 手） | 2案を下まで | screen |
+| Issue の実装（`claude-implement.yml`） | 実装AI（サイズで決まるモデル。直しは 50 手） | 変えた後の画面。足した所だけを見る | change |
+
+**あとから画面を足しても「らしさ」を消さない**：工場のデザイン担当は、`docs/design.md` の最初の節 `## このサービスらしさ`（考え・しるし・埋める物・新しい画面を足すときの決め方・通し表）を書く。実装AIは、画面に触るときここを読み、審査役は足した所がそれに沿っているか（`fits`）を見る。
+
+**既存アプリの作り直し**：画面全体の見た目を作り直す Issue（`ai:mocks`）では、画面案のAIは今の色・文字・部品の形に縛られない（今の画面は「何を載せているか」を知るためだけに見る）。最初に今の画面を審査役の問いで診断し、持ち物から考えを決め、組み方を配ってもらって2案を作る。オーナーが選ぶと、設計メモ（`ai-mocks` ブランチの `concept.md`）が実装AIに渡り、実装AIは `docs/design.md` の「このサービスらしさ」を書き直して、目標の画面に無い画面も同じ考えで作り直す。
+
+相談の2つの段階の間では、設計メモと使った絵の出どころ（`credits.json`）を `factory-talk` ブランチに置いて引き継ぎ、作り始めるときはデザイン担当に渡す（`factory-refs/issue/chosen-concept.md`・`chosen-credits.json`）。オーナーに見せるコメントには、ざっくり画面の下の欄（2画面目）の絵と、審査役の点の行が付く。
+
+## 言語と公開先（`pipeline.json`）
+
+リポジトリ直下の `pipeline.json` に、言語・確認コマンド・公開先を書く。**無ければ今までどおりの Next.js（Node 22・`npm ci`・型チェック／リント／テスト／ビルド・Vercel）**として動くので、既存のアプリは何もしなくてよい。読み取りは `.github/scripts/stack.sh`、実行環境を入れるのは `.github/actions/setup-stack`（CI・実装AI・修正AI・公開で共通）。
+
+```json
+{
+  "tools":  { "python": "3.12" },
+  "setup":  [ "pip install -r requirements-dev.txt" ],
+  "checks": [
+    { "name": "リント", "run": "ruff check ." },
+    { "name": "テスト", "run": "pytest -q" }
+  ],
+  "deploy": [
+    { "kind": "aws-apprunner", "service": "hello-api", "port": 8000, "health": "/health" },
+    { "kind": "github-release", "os": ["windows-latest", "macos-latest"], "build": "pyinstaller --onefile cli.py", "files": "dist/*" }
+  ]
+}
+```
+
+| 項目 | 内容 |
+| --- | --- |
+| `tools` | 入れる実行環境と版。`node`・`python`・`go`・`java`（Temurin）・`dotnet`。Rust・C/C++ などはランナーに最初から入っている物を使う |
+| `setup` | 依存を入れるコマンド（CIとAIの前に1回ずつ動く） |
+| `checks` | CIで順に**全部**回すコマンド（1つ落ちても最後まで回し、落ちた物をまとめて出す）。**実装AI・修正AIに許すコマンドもこれになる**（`"`・`,`・`(`・`)`・`` ` ``・`$`・`\` は許可の書き方を壊すので使えない。複雑な物はスクリプトにまとめて呼ぶ） |
+| `deploy` | 公開先の配列。同じ種類は最初の1つだけ使う |
+
+AIに許すコマンドを決めるので、`pipeline.json` と `.github/actions/` を触るPRは、どのリポジトリでも自動でマージしない（`ai:hold`）。書き間違いは、CI・公開の最初で `::error::` になり、Doctor でも ❌ で出る。
+
+公開先（`deploy.yml`。main の CI が通ったら動く。パイプラインの更新だけのコミットでは動かない）：
+
+| `kind` | 公開のしかた | 要る設定 | 書く物 |
+| --- | --- | --- | --- |
+| `vercel` | `deploy-vercel.yml` が、main の CI が通ってから3分（変数 `VERCEL_DEPLOY_DELAY_MIN`）待ち、その間にまたマージされたら新しい方だけが、最新の main を1回だけ本番に公開する（Vercel の無料プランは「1日100回まで」なので、マージのたびに公開しない）。最後に公開に成功したコミットから、パイプラインの物（`.github/`・`docs/pipeline.md`）しか変わっていなければ公開しない。Secret `VERCEL_TOKEN` が無いときは何もせず、Vercel が自分で公開する（今までの形）。`pipeline.json` が無いときの既定 | Vercel でリポジトリを読み込み、`vercel.json` を `"git": { "deploymentEnabled": false }` にし、`ignoreCommand` を消す（Vercel が自分で公開するのを止める。`ignoreCommand` は直前のコミットとの差しか見ないので、まとめて公開すると間の変更を見落として公開が飛ばされる）。`VERCEL_TOKEN` は工場（新しいサービス）と配布（`sync.yml` の vercel-token。`vercel.json` があるリポジトリだけ）が入れる | `VERCEL_TOKEN`（任意）、変数 `VERCEL_TEAM_ID`（チームのとき） |
+| `github-pages` | 静的なサイトを作って GitHub Pages に出す（`<ユーザー名>.github.io` という名前のリポジトリなら、そのアドレスのトップに出る）。Next.js なら `next.config` で `output: "export"`・`images: { unoptimized: true }` にする（サーバーで動く機能は使えない） | Settings → Pages の Source を **GitHub Actions** にする。工場が作るサービスは、工場が `FACTORY_TOKEN` で自動で有効にする（`build_type=workflow`）。それ以外は手で1回だけ。Doctor が、有効で Source が GitHub Actions かを確かめる（無効や別の Source は ❌ と直し方、読めないときは ⚠️）。公開が失敗したときの知らせ（`deploy/pages`）には、設定のページの URL が付く | `build`（作るコマンド。既定 `npm run build`）、`dir`（出すフォルダ。既定 `out`） |
+| `aws-apprunner` | Docker のイメージを作って ECR に置き、App Runner で動かす。最初の公開でサービスを作り、2回目から差し替える。言語を選ばない（Web・API） | 下の「AWS App Runner」 | `service`（サービス名・小文字の英数字と `-` `_`。ECR の名前にも使う）、`port`（既定 8080）、`dockerfile`（既定 `Dockerfile`）、`cpu`（既定 256）、`memory`（既定 512）、`health`（HTTPのヘルスチェックのパス。省くとTCP） |
+| `github-release` | OS ごとに配布物（exe など）を作り、GitHub Releases に置く。ファイル名に OS が付く（`hello.exe` → `hello-windows.exe`）。タグは `build-<日時>-<コミット>` | なし | `build`（作るコマンド）、`files`（置くファイル。例 `dist/*`）、`os`（既定 `["windows-latest"]`。`macos-latest`・`ubuntu-latest` も） |
+| `expo` | スマホアプリを Expo（EAS）で配る。既定は `eas update`（アプリを入れ直さずに中身を更新） | Secret の `EXPO_TOKEN` | `command`（既定 `npx --yes eas-cli@latest update --auto --non-interactive`。ストアに出すなら `eas build --auto-submit ...`） |
+| `supabase` | `supabase/migrations/*.sql` のうち、まだ流していない物を番号の順に1ファイルずつ流す（`deploy-supabase.sh`。流した印は `app_meta.migrations`。1ファイル1まとまりで、失敗したら後ろは流さない）。Vercel の公開より先に動く | Secret の `SUPABASE_DB_URL`（工場が saas を作るときに入れる） | なし |
+| `none` | 公開しない | なし | なし |
+
+結果はコミットの状態（`deploy/<kind>`）に書き、スマホに通知する（`deploy-status.sh`）。
+
+### AWS App Runner（1つの AWS アカウントで1回だけ）
+
+鍵（アクセスキー）は GitHub に置かない。GitHub の OIDC で、main からの実行だけが AWS の役割を一時的に借りる。
+
+1. AWS の画面 → **CloudFormation** → **スタックの作成**（新しいリソースを使用）→ **テンプレートファイルのアップロード** で `.github/deploy/aws-apprunner-setup.yml` を選ぶ
+2. スタックの名前は好きに（例：`github-apprunner`）。`GitHubOwner` は自分の GitHub のユーザー名。このアカウントに GitHub の OIDC（`token.actions.githubusercontent.com`）をもう作ってあれば `CreateOidcProvider` を `false`
+3. 「IAM リソースが作成される場合があることを承認します」にチェックして作成。数十秒で終わる
+4. スタックの **出力** に出る3つを、公開するリポジトリの Settings → Secrets and variables → Actions → **Variables** に入れる：`AWS_ROLE_ARN`・`AWS_APPRUNNER_ACCESS_ROLE_ARN`・`AWS_REGION`
+5. Doctor を実行して「✅ 公開先：AWS App Runner」が出れば完了。次に main にマージされたとき、最初の公開でサービスができる（数分）。URL は通知と agent-desk に出る
+
+料金：App Runner は動いている間（いちばん小さい 0.25 vCPU・0.5 GB）と、イメージの置き場（ECR）の分がかかる。使わないサービスは App Runner の画面で「一時停止」すると、置き場の分だけになる。
+
+### Expo（スマホアプリ）
+
+1. expo.dev にログインし、アプリを作る（`npx eas-cli init` をパソコンで1回）
+2. expo.dev → Account settings → **Access tokens** で作り、Secret の `EXPO_TOKEN` に入れる
+3. `pipeline.json` の `deploy` に `{ "kind": "expo" }`（ストアに出すときは `command` を書く）
+
+## 工場（1行から新しいサービスを作る）
+
+ai-dev-template に、タイトルが **`新サービス：`** で始まるIssueを書くと（例：「新サービス：毎朝の天気と予定を1枚で見られるページ」）、`factory.yml` が新しいサービスのリポジトリを作って、いつものパイプラインに渡す。テンプレート本体で、オーナーが書いたIssueでだけ動く。Issue の本文は「詳しいメモ」として、名前決め・デザイン担当・最初のIssueに渡る（載せたい中身や、見た目の雰囲気。3000文字まで）。本文に**画像（リールのスクショ・好きなサイトの画面など）を貼ると**、デザイン担当がいちばん大事な実例として見る（`.github/scripts/fetch-issue-images.sh` が AI の前に取ってくる。10 枚まで）。URL を書けば、それも撮って見る。
+
+### 相談してから作る（`factory-talk.yml`。ふつうはこちら）
+
+いきなり作らず、オーナーに選んでもらいながら、作る物と見た目を最初に大まかに決める（あとの作り直しを減らすため）。AIの決まりは `.github/factory/talk.md`、形の確かめとコメントは `.github/scripts/factory-talk.py`・`factory-talk-publish.sh`。
+
+1. **案**：AIが、作る物の案を5つ（名前・種類・使う人・新しい所・有料の分け方・画面）と、選択式の質問を Issue のコメントに書く
+2. **見た目の方向**：選んだ案の方向を3つ。色違いではなく、題材の持ち物から作った考えが3つ。それぞれ、本物の素材で組んだ「最初の1画面」を、色・文字の見本と実例と一緒に1枚の板の画像にする（審査あり。上の「デザインの仕組み」）
+3. **ざっくり画面**：選んだ方向で、トップの画面を下の欄まで全部、2案（1枚の HTML。PC とスマホを撮る。審査あり）
+4. **最終確認**：名前・説明・無料と有料・値段・最初に作る画面・決まった事を1枚にまとめる。「作る」と返事すると、`factory.yml` を動かす（相談で決めた事をそのまま使い、名前をAIに決め直させない。デザイン担当は、選んだざっくり画面と方向の板を土台に本物を作る）
+
+- 各段階で、コメントの最後に選択式の質問を付ける。オーナーの返事（番号・「全部ちがう。もっと〇〇」・注文）は、AIが「選んだ物・質問の答え・注文」に読み替える（agent-desk のボタンからの返事は、印 `<!-- factory-answer:… -->` の形が決まっているので、AIを通さない）
+- 返事を待つ間は `factory:wait` が付く（答えるまで待つ。スマホに通知 `question`）。今までに決まった事はコメントの印 `<!-- factory-talk:v1:… -->` に入れて、毎回そこから読む
+- 板とざっくり画面の画像・HTML は、テンプレートの `factory-talk` ブランチの `issue-<番号>/r<回>-<段階>/` に置く（コメントの画像と、作り始めたときのデザイン担当が使う）
+- 作れなかったときは、そう書いて待つ。「もう一回」と返事すると、同じ段階をやり直す
+- 案はいくつかを1つのサービスにまとめて選べる（`1,3`・`1〜4`）。前の段階の選び直し（「やっぱり案は 1,2」）もでき、その段階から先を作り直す
+- AIが作っている途中に書いた返事も捨てない（同じ Issue の実行は順番待ちになり、出る前の選択肢への返事として読む）。作り始めた後（`factory.yml` を動かした後）のコメントは、相談の返事として読まない
+- Issue に「全部おまかせ」とある（Issue のテンプレートのチェック）と、相談せずに下の流れで全部決めて作る
+
+### 全部おまかせ（`factory.yml`）
+
+1. AIが、名前（英語の小文字と -）・種類（画面のあるWebなら Next.js、会員登録と月額の有料プランがあるWebなら saas、処理が中心なら Python、exe のゲームなら game、ブラウザで遊ぶゲームなら webgame）・1行の説明を決める（AIは名前を書くだけで、鍵は持たない）。メモが中身を任せているときは、ありきたりでない案を10個考えて1つ選ぶ（ToDo・家計簿・タイマー・割り勘・サブスク管理などは選ばない）
+2. **デザイン担当**（Next.js とゲームのとき。`.github/factory/design-department.md`）：AIが見た目を決めて、**本物の Next.js の画面を最後まで作る**。それがそのまま新しいリポジトリの最初の中身になる（前は、試作の HTML と文章の仕様を描いて、別のAIが作り直していた。伝言で質が落ちるのでやめた）
+   - **設計メモから始める**：色や文字を選ぶ前に `factory-refs/concept.md`（題材の持ち物・考え・埋める物・通し表）を書く。作った画面は、確認コマンドが通ったあと、関門と審査役が見る（上の「デザインの仕組み」。11月2日に審査役を外したが、作った本人だけでは「最初の1画面だけ凝る」「本物と答えたのに描いた絵で済ます」を止められなかったので、11月16日に、合格をスクリプトが決める形で戻した）。結果の点は、できたときのコメントに載る
+   - **実例から作る**：描く前に、題材と雰囲気に近い実在のサイトを 8〜15 個探して（日本語の組み方の参考になる日本のギャラリー（SANKOU! など）から先に。Issue にギャラリーの URL を書けば、そこから拾う） `shot.mjs --scrolls` で撮り、良い所を `factory-refs/board.md` に書いて、どれのどこを混ぜるか決める（言葉だけで考えると平均的な画面になるため）。Issue に貼った画像がいちばん大事な実例
+   - **決まりは最低限＋AI感を出す前に弾く**：読める・押せる・スマホで崩れない・動きを止められる・目的が果たせる・実在のブランドを写さない。そのうえで、`.claude/skills/taste-skill/`（実在の良いサイト 247 個の調べから方向を配り、AIが作った感を測って弾くスキル）を使う：方向は `draw.mjs` に配ってもらう（ページは `--options 3`、道具の画面は `--app`）、AIが作った感の一覧（`references/tells.md`。クリーム色の地＋朱・テラコッタ、罫線だらけ、等幅の数字、インディゴ・紫など）を使わない、本物の写真・古い地図・図版を `assets.mjs` で探して使う、出す前に `lint.mjs`・`inspect.mjs` で測って FAIL を直す。工場の相談（見た目の方向・ざっくり画面）でも同じ（`.github/factory/talk.md`）。11月2日にいったん外した（禁止を足し続けて地味になったため）が、相談の画面がAIっぽいとオーナーが言ったので 11月16日に戻した。今のスキルは「飾りを消した分を、大きい文字・色の面・本物の写真・中身で埋める」作りなので、前のように地味にはしない
+   - **作って、撮って、実例と見比べて直す**（最低3回）。写真は `.github/scripts/fetch-photos.sh "<英語の検索語>" <枚数>` で Openverse（届かなければ Wikimedia Commons）から CC0・パブリックドメインの物だけを `public/photos/` に取る（鍵は要らない。画面のあるアプリの実装AIも使える。合わせて 20 枚まで、出どころは CREDITS.md。画面で使った写真だけが入る）。動き・3D の道具は `.github/scripts/factory-add-lib.sh <名前>` で、決まった物（`gsap`・`@gsap/react`・`lenis`・`motion`・`three`・`@react-three/fiber`・`@react-three/drei`・`pixi.js`。`.github/scripts/factory-libs.sh`）だけをその場で入れ、新しいリポジトリにも同じ物が入る（アプリのAIは依存を足せないため）
+   - 最後に `docs/design.md`（あとのIssueで同じ見た目を作るための決まり）を書き直す。ワークフローが確認コマンド（typecheck・lint・test・build）をAIとは別に動かし（`.github/scripts/factory-checks.sh`）、通らなければ1回だけ直させる。**通った物だけ**を、`.github/scripts/factory-site.py` が形を確かめてから新しいリポジトリの `src/`・`public/` に入れ、最後に撮った画像を `docs/design-ref/` に入れる。通らなかったときは、今までどおりメモの1行を最初のIssueにして、実装AIが作る
+   - **ゲームのとき**：design ジョブは最初に `.github/scripts/factory-game.sh` で見本（`examples/game`。TypeScript・Vite・Canvas／WebGL・Vitest・Electron）に切り替えてから、デザイン担当に渡す。デザイン担当はタイトル → 遊ぶ → 終わりまで作り、`/?scene=play` のように途中の場面を URL で開けるようにして、1280・1920 の幅で撮る。確認コマンドは `pipeline.json` にある物だけ（lint は無い）。exe は、新しいリポジトリの公開（`github-release`、Windows のランナーで `npm run dist`）が作って Releases に置く
+   - **ゲームはありきたりにしない**：作る前に遊び方の案を 10 個出し、有名なゲームの遊び方そのまま（積み上げ・Flappy・ランナー・2048・マッチ3 など）や、見た目を変えただけの物は捨てて、見たことのない一ひねりがある物を選ぶ（`board.md` の「## アイデア」。結果のコメントに畳んで載せる）
+   - **会員と課金（saas）のとき**：design ジョブは最初に `.github/scripts/factory-saas.sh . install` で、ログイン（Supabase）と有料プラン（Stripe）の土台（`examples/saas`）を入れてから、デザイン担当に渡す。デザイン担当は無料と有料の違いを決め、トップ・料金（`/pricing`）・ログイン・アカウントの画面を作り、月額の値段を `factory-price.txt` に書く（課金の土台のファイルは変えない。下の「会員と課金」）
+   - **Web のゲーム（webgame）のとき**：見本は `examples/webgame`（Electron を入れない）。スマホの縦画面をいちばん大事にして、タッチで遊べ、結果を共有できるように作る（`design-department.md`「Web のゲームのとき」）。390・1440 の幅で撮る。公開は Next.js と同じく Vercel（プロジェクトの種類は Vite）
+   - **ゲームの日本語の書体**（game・webgame とも）：`factory-game.sh` が M PLUS 1 の可変フォント（`examples/game-fonts/`。OFL）を `assets/fonts/` に入れる。`npm run build`・`npm run dev` の前に `npm run fonts`（`scripts/subset-fonts.mjs`、開発用の依存 `subset-font`）が、`src/` と `index.html` に出る文字と、かな・記号・英数字だけを抜き出して `public/fonts/mplus1.woff2` を作る（300KB を超えたら失敗。`public/fonts/` は git に入れない）。見本の `index.html` に `@font-face`（"GameJP"、太さ 100〜900）、`src/main.ts` に `JP_FONT` と読み込み待ちがある。実装AIは `curl`・`python3` を使えず書体を作れないので、最初から入れておく（文言を変えても作り直し不要。どの PC・ブラウザでも同じ見た目になる）
+3. `factory.sh` が、テンプレートからリポジトリを作る（同じ名前があれば `-2` …）
+4. パイプラインの秘密（`CLAUDE_CODE_OAUTH_TOKEN`・`PIPELINE_APP_PRIVATE_KEY`・`PIPELINE_TOKEN`・`NTFY_TOPIC`）と変数（`PIPELINE_APP_ID`・`NOTIFY_EVENTS`・`AGENT_DESK_URL`）を、テンプレートの物から写す
+5. Next.js・saas・Web のゲームで `VERCEL_TOKEN` があれば、Vercel のプロジェクトを作ってつなぐ。saas なら続けて、Supabase のプロジェクト・Stripe の商品と値段を作り、鍵を Vercel の環境変数に入れる（`factory-saas-provision.sh init`。最初の公開より前）
+6. `CLAUDE.md` の1行目・仕様書の「目的」・README に説明を書き、デザイン担当が作った画面とデザイン仕様と道具を入れ、Python なら見本（`examples/python`）に切り替えて（公開先は none）、ゲームなら見本（`examples/game`）に切り替えて（公開先は GitHub Releases の exe）、Web のゲームなら見本（`examples/webgame`）に切り替えて（公開先は Vercel）、saas なら会員と課金の土台を入れて（公開先は Vercel と、表の変更の supabase）、main に push する。この push で Bootstrap が動く。そのあと、新しいリポジトリの `pipeline.json` の公開先に `github-pages` があれば、`FACTORY_TOKEN` で GitHub Pages を有効にする（`POST repos/<新しいリポジトリ>/pages`、`build_type=workflow`。もう有効（409）なら成功として扱い、失敗したら結果のコメントに設定のページの URL 付きで直し方を書く。ワークフローのトークンでは有効にできないため、ここで行う）。`github-pages` が無ければ呼ばない
+7. main を守る（PRと CI の `check` を必須にする。管理者は通れる）
+8. 最初のIssueを作る（自動で企画に回る）。デザイン担当が画面を作れていれば、作りきれなかった残り（`factory-todo.md`、3つまで）だけをIssueにする（無ければ作らない）。作れていなければ、1行のメモを最初のIssueにする（最初の画面を一から作るので `size:L`＝強いモデルで実装する）。Vercel につないだときは、本番の公開アドレスを調べて報告に書き、リポジトリの Website 欄にも入れる（同じ名前がほかの人に使われていると、アドレスの後ろに文字が付く）。saas なら、公開アドレスで Stripe の通知の受け口とログインの戻り先を登録し（`factory-saas-provision.sh url`）、環境変数を効かせるため公開をやり直す。元のIssueに結果を書いて閉じる（デザイン担当が撮った画面の画像も貼るので、公開を待たずにどんな画面か見られる）
+
+テンプレートの受付（intake）は、`新サービス：` のIssueを企画に回さない。工場は最初にIssueへ `factory` の印を付け、企画AI・実装AIは、題が `新サービス：` で始まるか、この印があるIssueを、テンプレート自身では受けない（題が書き換えられても止まる）。
+
+### 会員と課金（saas）
+
+会員登録・ログインと、月額の有料プランがあるサービス。Next.js に、Supabase（ログインとデータベース）と Stripe（課金）の土台（`examples/saas`。説明は新しいリポジトリの `docs/billing.md`）が入る。
+
+- 最初の1回だけ、Environment「factory」の Secret に2つ入れる
+  - `SUPABASE_ACCESS_TOKEN`：supabase.com → Account preferences → Access Tokens。Resource access は **Organization**（自分の組織。新しく作るプロジェクトにも効く）。Permissions は Project Settings（Read and write。ログインの設定を変えるのに Auth Config と両方要る）・Database と Migrations（Read and write）・Connection Pooling（Read）・API Keys（Read and write）・API Key Secrets（Read）・Auth Config（Read and write）・Organizations（Read）・Organization Projects（Read and write）・Projects (account-wide)（Read）。ほかは None
+  - `STRIPE_SECRET_KEY`：Stripe のダッシュボード（テスト環境）→ 開発者 → API キーのシークレットキー（**`sk_test_` だけ**。本番の鍵は工場が使わない）
+- 工場がサービスごとに作る物：Supabase のプロジェクト（東京。最初の表と、確認メールを送らない設定）、Stripe の商品・月額の値段（デザイン担当が決めた円。既定 500 円）・会員ページの設定・通知の受け口（`<公開アドレス>/api/stripe/webhook`）、Vercel の環境変数（`docs/billing.md` の表）、新しいリポジトリの Secret `SUPABASE_DB_URL`（あとで表を足す公開が使う）
+- あとのIssueで表を足すときは、AIが `supabase/migrations/0002_〜.sql` を足し、マージ後の公開（`supabase`）が流す。RLS は必須
+- Supabase の無料プランは、動いているプロジェクトが2つまで。3つ目を作るときは、使わないプロジェクトを一時停止する（工場は作れなかった理由を Issue に書く）
+- 本物の課金にするのは人間の作業：Stripe の本人確認と口座、特定商取引法に基づく表記・利用規約・プライバシーポリシーのページ、Vercel の `STRIPE_SECRET_KEY`・`STRIPE_PRICE_ID`・`STRIPE_WEBHOOK_SECRET` を本番の物に差し替え
+
+### 最初の1回だけの準備
+
+- **Environment「factory」**を作る：ai-dev-template の Settings → Environments → New environment で名前 `factory`。Deployment branches and tags を **Selected branches and tags** にして `main` だけを足す（強い鍵を、main のワークフローからだけ使えるようにする。AIが作ったブランチからは読めない）。下の2つの Secret は、リポジトリではなくこの Environment の Secrets に入れる
+- **`FACTORY_TOKEN`**：リポジトリを作れる鍵。github.com → Settings → Developer settings → Fine-grained tokens で作る。Resource owner は自分、Expiration は **90日くらい**（切れたら作り直して入れ直す）、Repository access は **All repositories**、Permissions（Repository）は **Administration・Contents・Secrets・Variables・Issues を Read and write**（Metadata は自動で Read）。Administration は、リポジトリの削除までできる強い権限なので、この鍵はほかに使わない
+- **パイプラインの GitHub App** を、**All repositories** に入れておく（新しいリポジトリでも、すぐ鍵が使えるように）。App の画面 → Install App → 自分のアカウントの Configure
+- **Next.js を公開するなら**：`VERCEL_TOKEN`（Environment「factory」の Secret。Vercel → Account Settings → Tokens）と、Vercel の GitHub 連携を **All repositories** にしておく。チームで使うなら変数 `VERCEL_TEAM_ID`
+- **会員と課金（saas）を作るなら**：Environment「factory」の Secret に `SUPABASE_ACCESS_TOKEN` と `STRIPE_SECRET_KEY` を入れる（下の「会員と課金」）
+- 無い物があっても、作れる所までは作り、元のIssueに「何が無くて何をしなかったか」を書く
+- あとから Vercel につなぐとき（作ったときに VERCEL_TOKEN が無かった物など）：Actions → **Factory Vercel** → Run workflow で、リポジトリの名前を入れる（つないだあと、今の main で本番の公開を1回始め、公開アドレスを Website 欄に入れる。もうつないであるリポジトリなら、公開とアドレスの調べ直しだけ）
+
+## 進捗ログ
+
+各工程が「使ったモデル・所要時間・結果」を、Issue の「進捗ログ」コメントに残す（`.github/scripts/step-log.sh`）。agent-desk の進捗図が、このコメントを機械で読んで表示する。記録するだけで、ラベル・自動修正・マージ・公開・モデルの切り替え方は変わらない。
+
+### コメントの形式
+
+- コメントは Issue ごとに1つだけ。先頭の行が目印 `<!-- ai-step-log -->`。これで探し、あれば編集、無ければ新しく作る（コメントは増えない）
+- 次に、人が読む表（工程・モデル・所要時間・結果・修正）
+- 最後に、機械が読む行を工程ごとに1行：`<!-- ai-step {JSON} -->`（工程の順に並ぶ）
+
+```
+<!-- ai-step {"step":"fix","model":"opus","started":"2026-11-15T07:32:00Z","finished":null,"result":"running","attempt":3,"max_attempts":3} -->
+```
+
+| 項目 | 値 |
+| --- | --- |
+| `step` | `plan` / `mocks` / `implement` / `ci` / `review` / `fix` / `deploy` |
+| `model` | 実行時に `--model` へ渡した値そのまま（`opus`・`sonnet`・`fable` など）。モデルを使わない工程（`ci`・`deploy`）は `null` |
+| `started` | 開始時刻（UTC の ISO 8601。例 `2026-11-15T07:28:00Z`） |
+| `finished` | 終了時刻（同じ形）。未完了なら `null` |
+| `result` | `running`（進行中） / `success` / `failure` |
+| `attempt`・`max_attempts` | 修正（`fix`）のときだけ。何回目 / 最大3回 |
+
+### どこで残すか
+
+| 工程 | 残す所 | 進行中（`running`）も残すか |
+| --- | --- | --- |
+| `plan` | `claude-plan.yml`（AIの前に開始、`after-plan` で終了） | 残す |
+| `mocks` | `claude-mocks.yml` の `publish`（終了だけ。開始時刻は `work` から渡す） | 残さない |
+| `implement` | `claude-implement.yml`（AIの前に開始、`open-pr` で終了。結果は、PRができたか、またはAIが成功で終わったかで決める。AIが作業回数の上限を超えて「失敗」で終わっても、PRができていれば成功。PRを作るトークンが無く、人間がPRを作る構成では、AIが成功で終わっていれば成功） | 残す |
+| `ci` | `pipeline.yml` の `after-ci`（終了だけ。開始時刻はCIの実行の開始時刻） | 残さない |
+| `review` | `pipeline.yml` の `after-review`（終了だけ。モデルと開始時刻は、`claude-review.yml` が成果物 `ai-result` の `meta.json` で渡す） | 残さない |
+| `fix` | `claude-mention.yml`（自動の修正依頼 `auto-fix` のときだけ。何回目かは依頼の「自動の依頼 n/3」から読む） | 残す |
+| `deploy` | 残さない。公開の状態は、コミットの状態（`deploy/<種類>`・Vercel）に出るので、agent-desk はそちらを読む | - |
+
+進捗ログのコメントは、どこでもワークフローのトークン（`github.token`）で書く。パイプラインの鍵が `PIPELINE_TOKEN`（オーナーのトークン）のリポジトリで、オーナーの名義のコメントが「質問への答え」（`answer.yml`）と間違われないようにするため。進行中を残さない工程が動いているかは、ラベルと Actions の実行で分かる。
+
+### 更新のしかた
+
+工程の開始前に `--result running`、終了後に `--result success` か `failure` で呼ぶ。同じ工程の行は上書きされる（`running` の行があれば `started` を引き継ぐ。修正は回数が進むので `--attempt` を更新する）。
+
+```
+.github/scripts/step-log.sh --pr 30 --step fix --model sonnet --result running --attempt 1 --max-attempts 3
+```
+
+- `--issue N` か `--pr N`（PR 本文の `Closes #番号` かブランチ名から Issue を引く）のどちらかを渡す
+- `--model` には、そのワークフローが AI に渡している値をそのまま渡す。使わない工程は `null`
+- 記録に失敗しても（gh のエラー・権限など）終了コードは 0。警告を1行出すだけで、パイプラインは止まらない
+
+## 画面案が作れないとき・AIの結果の見える化
+
+見た目の大きい Issue では、作る前に画面案（`ai:mocks`、`claude-mocks.yml`）を作る。AIは専用の手順書 `.github/factory/mocks.md`（置き場は `mocks/` だけ）を読んで作る。作れた画面案は、関門と審査役が見て、届かなければ1回直してからオーナーに見せる（上の「デザインの仕組み」。審査で止まることは無い）。AIが画面案を書かずに終わったとき（`mocks/mocks.json` が無い）は、止まらずに次の順で進む。
+
+1. **その場で1回やり直す**：`work` ジョブの中で、拒否されたツールの名前を手がかりに付けて、もう一度AIを動かす（3回目は無い）
+2. **それでも無ければ、案なしで企画へ**：`publish` が `MOCKS_RETRY=1` で `mocks-publish.sh` を動かす。画面案が無い・形が不正なら、`ai:mocks` を外して `ai:plan` を付け、「画面案は作れなかったので、案なしで進めます」とコメントする（拒否されたツール名も入る）。`ai:stuck` にはしない
+3. 画面案が作れたときの動き（`ai:question` で選んでもらう）は変わらない
+
+`mocks-publish.sh` は、`MOCKS_RETRY` が無いとき（古い workflow）は以前どおり `ai:stuck` で止まり、`0` のときは `retry=true` を出すだけで何もしない（別のジョブでやり直す作りのための形。今の workflow は使っていない）。
+
+`publish` の鍵は、ほかの workflow と同じく GitHub App の鍵 → `PIPELINE_TOKEN` → `github.token` の順に使う（`github.token` で付けた `ai:plan` では企画が動かないので、そのときは見張り役が拾うまで待つ）。
+
+### ai-report.sh（AIの工程のあと、何が起きたかを残す）
+
+AIが「正常に終わったのに何も残さなかった」とき、あとから理由を追えるように、どのAIの工程のあとにも `.github/scripts/ai-report.sh` が、実行記録から次をジョブのログと実行の Summary の両方に出す。
+
+- 結果の種類（`success`・`error_max_turns` など）・手数・拒否の数
+- 拒否された操作（そのままの形で最大5件）
+- AIが最後に言ったこと（最大1,200文字）
+
+```
+.github/scripts/ai-report.sh --title "実装AI" FILE
+```
+
+ファイルが無い・壊れていても、いつも終了コード 0。企画は `after-plan`、実装は `open-pr`（どちらも main の版を動かす別のジョブ）、画面案と修正AIは同じジョブの中（画面案は `.github/` を読み取り専用にしてある。修正AIは API で取ってきた main の版）で動かす。レビューは作業フォルダがPRのコードなのでスクリプトを動かさず、同じ要点を `jq` で出す。
+
+### denials.sh（拒否の中身を取り出す）
+
+AIの実行記録から、許可されず拒否された操作（`permission_denials`）の `tool_name` と引数（1件あたり約200文字で切り詰め）を取り出す（`.github/scripts/denials.sh`）。
+
+```
+.github/scripts/denials.sh FILE            # 件数と一覧（テキスト）
+.github/scripts/denials.sh --summary FILE  # Summary 用の Markdown。GITHUB_STEP_SUMMARY に追記
+.github/scripts/denials.sh --comment FILE  # コメント用の短い文（拒否されたツール：Write、Bash）
+.github/scripts/denials.sh --check FILE    # 拒否が1以上なら終了コード 0、無ければ 1
+```
+
+`--check` 以外は、ファイルが無い・壊れている・拒否が無いときは何も出さず、終了コード 0。
+
+### 成果が無いまま終わったときの動き（まとめ）
+
+| AI | 成果が無いとき |
+| --- | --- |
+| 企画AI | `plan-result.txt` が無ければ、2回まで自動でやり直し（`ai:retry`）、続くなら理由を書いて人間に回す（`after-plan.sh`） |
+| 画面案 | その場で1回やり直し、それでも無ければ案なしで企画へ（上） |
+| 実装AI | 拒否があれば、手がかりを書いて1回だけやり直す。拒否が無ければ、AIが最後に言ったことを書いて人間に回す（`open-pr.sh`） |
+| レビューAI | まとめのコメントが無ければ、2回まで自動でやり直し、続くなら人間に回す（`after-review.sh`・見張り役） |
+| 修正AI | 理由を分けて動く（上の `classify_no_change`）。実行記録は `claude-mention.yml` が成果物 `ai-result` で `after-mention` に渡す |
+
+## 順番待ちの進め方（`ai:queue`）
+
+企画AIは、清書した本文の最後に「触るファイル」の印（`<!-- ai-touches: src/lib/a.ts, src/components/ -->`。/ で終わる物はフォルダ）を書く。順番待ちを進めるとき（`queue-next.sh`・見張り役。`pipeline-lib.sh` の `start_next_in_queue`）：
+
+- 進行中の物（`ai:implement` の Issue・open のPR）が無ければ、先頭の1つを始める。先頭は `priority:high` が付いた物、その中は番号の小さい順
+- 進行中の物があっても、並列の上限（`MAX_PARALLEL`、既定 2）に達しておらず、触るファイルが進行中の物と重ならない物は、並べて始める。重なりは「同じファイル」「片方のフォルダの中にもう片方がある」。進行中の物の触るファイルは、PRがあればPRの変えたファイル（配布・依存の更新など AI 以外のPRも）、PRがまだ無ければ Issue の印
+- 見た目のテスト（`tests/visual/`）があるリポジトリでは、画面のファイル（`app/`・`components/`・`styles/`・`pages/`、`src/` の下も）を触る物どうしも重なりとみなす（基準の画像がぶつかって止まったため。agent-desk #308）
+- 印の無い物・進行中の物に印の無い物があるときは、今までどおり進行中の物が全部終わるまで待つ
+- 止まっている物（`ai:stuck`）は数えない（今までどおり）
+
+## 使ってみる役・監査役（`claude-try.yml`・`claude-audit.yml`）
+
+「他人が一人で、会話なしで使える」と「仕様書が食い違っていない」を、パイプラインが自分で確かめる。見つけた問題は Issue（`ai:found`・`ai:plan`）にして、いつもの流れ（企画→実装→…）で直す。
+
+| 役 | いつ動く | 何をする | 上限 |
+| --- | --- | --- | --- |
+| 使ってみる役（`claude-try.yml`） | 毎日 21:13（日本時間）。ただし公開しているサイトの URL があり、main が直近24時間に変わった日だけ（＝公開があった日。1日1回まで） | 初めて使う利用者として、本番のサイトを本物のブラウザ（`shot.mjs`）で 390・1440 の幅で開き、`docs/spec.md` の主な使い方を試す。壊れている・迷う・崩れている所を探す（好みの問題は書かない。ログインが要るサービスでは、ログインの手前の画面だけ） | 1回に最大3件 |
+| 監査役（`claude-audit.yml`） | 毎週月曜 3:41（日本時間）。ただし進行中の作業（`ai:plan`・`ai:implement`・`ai:review`・`ai:queue` の Issue、`claude/` のPR）が無いときだけ。`docs/spec.md` が無いリポジトリでは動かない | 仕様書の中・仕様書とデザイン仕様・仕様書とコードの食い違いを探す。どちらに合わせるかと、直すときに触るファイルも書く（誤字・好み・まだ作っていない機能は書かない） | 1回に最大3件 |
+
+- 動かすかは `found-gate.sh try|audit` が決める。公開先の URL は、GitHub Pages の公開があればその URL、無ければリポジトリの「Website」（工場が公開先を書く）。Actions の画面から手で動かすと（`force`）、日付・進行中の条件を見ずに動く
+- AIは結果を `.try/result.json`・`.audit/result.json`（`{"findings":[{"title","body"}]}`）に書くだけ。Issue は、別のジョブ（`report`）が main の版の `found-report.sh` で作る（AIのジョブにはパイプラインの鍵を渡さない）。同じ題名の `ai:found` の Issue が開いていれば作らない（空白の違いは無視）
+- 撮った画像は、その実行の artifact（`try-out`・14日）に残り、Issue の本文にログの場所を書く
+- モデルは sonnet（使う量を抑えるため）。手数の上限は 使ってみる役 60・監査役 80
+- AIが結果のファイルを書かずに終わったとき（使用の混み合い 529 など）は、その場で1回だけやり直す。それでも無ければ「確かめられていない」と警告を残す（「問題なし」とは扱わない）
+- 長くなりすぎた節（目安：1つの節が約40行を超え、重複や言い換えが多い）を、意味を変えずに短くまとめる提案も、監査役が出せる。結果の `findings` の要素に `"kind":"shorten"` を書く（`body` には元の節の見出し＝ファイルと見出しの文字と、短くした文案）。`found-report.sh` は、この案に `ai:found` と `ai:skip` を付けて作る（`ai:plan` は付けない）。本文の最後に `<!-- ai-found-kind: shorten -->` の印が付く
+  - 人間が確認するまで、実装には回らない。**意味を変えない**（決まり・数値・例外を落とさない）案だけを出し、迷う節は出さない。人間が案を読んで良ければ `ai:skip` を外すと、企画に回る
+  - 枠は食い違いと合わせて1回に最大3件（`FOUND_MAX`）。同じ題名の重複チェックも同じ
+
+## 他の Issue・PR の完了待ち（`ai:blocked`）
+
+「別の作業の結果や決まりが無いと、清書も実装も始められない」Issue を、人間が回し直さなくても進める仕組み（例：ai-dev-template で形式が決まり、アプリのリポジトリに配られてから始める作業）。
+
+1. 企画AIが `plan-result.txt` の1行目に `BLOCKED`、2行目から下に待ち先を1行に1つ書く（`owner/repo#番号`。このリポジトリなら `#番号`。Issue・PR の URL でもよい。最大10件）。あわせて、何を待っているかを Issue にコメントする
+2. `after-plan.sh` が `ai:blocked` を付け、待ち先の印 `<!-- blocked-by: owner/repo#N -->`（待ち先ごとに1つ）をコメントに書く。待ち先が1つも読み取れなければ、理由を書いて人間に回す
+3. 見張り役（`watchdog.sh`。30分ごとと、ほかの作業が終わるたび）が、いちばん新しい待ち先のコメントの印を読み、待ち先の状態を見る（Issue も PR も `issues` の API で読める。PR はマージ・クローズで `closed`）
+   - 全部 `closed`：`ai:blocked` を外して `ai:plan` を付ける（企画AIが、待ち先の結果を読んで清書する）
+   - 1つでも開いている：待つ
+   - 読めない待ち先がある：戻さない（間違って再開しない）。読めないまま60分（`BLOCKED_UNREADABLE_MIN`）たったら、理由を書いて人間に回す
+4. 別のリポジトリの待ち先は、公開リポジトリならパイプラインの鍵で読める。非公開のリポジトリは、鍵がそのリポジトリも読めるときだけ
+
+進行中の作業と同じ場所を触るだけ（結果を使うわけではない）なら、`ai:blocked` ではなく順番待ち（`ai:queue`）を使う。
+
+## スクリプトのテスト
+
+`.github/scripts/tests/` に、進行役のスクリプトのテストがある。本物の GitHub には触らず、疑似の `gh`（`tests/fake-gh`）が状態をファイルに持つ。
+
+- 全部実行：`.github/scripts/tests/run-all.sh`（CIの `script-tests`、`shellcheck` も同じ物を見る）
+- 書き方は `tests/lib.sh` の冒頭。スクリプトを変えたら、場面に合うテストを足す
+- 変更を入れる前にテストを壊してみて（わざとバグを入れる）、テストが落ちることを確かめると確実
+
+## セットアップの診断
+
+新しいリポジトリを作ったら、Actions の「Doctor」を1回実行する。Secret・ラベル・設定・`CLAUDE.md` やスクリプトの名前を調べて、✅／⚠️／❌ で、直し方つきで Summary に出す（`.github/scripts/doctor.sh`）。❌ が無くなれば Issue を書くだけで動く。
+
+## 必要な設定（リポジトリの Settings → Secrets and variables → Actions）
+
+| 名前 | 種類 | 内容 |
+| --- | --- | --- |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Secret | `claude setup-token` で作るトークン（Claudeのサブスクで動かす） |
+| `PIPELINE_APP_ID` | Variable | パイプライン用の GitHub App の App ID（おすすめ）。これと下の鍵があれば、`PIPELINE_TOKEN` の代わりに App の1時間だけの鍵を使う。回数制限がオーナーと別になり、期限切れが無く、操作が「App名[bot]」の名義になる |
+| `PIPELINE_APP_PRIVATE_KEY` | Secret | その App の秘密鍵（.pem の中身をそのまま） |
+| `PIPELINE_TOKEN` | Secret | オーナーのFine-grained トークン。ラベル・コメント・PR作成・マージに使う。これで操作すると次のワークフローが動く（Actions標準のトークンだと動かない）。無い間は、PR作成とマージを人間がする |
+| `NTFY_TOPIC` | Secret | スマホ通知（ntfyアプリ）のトピック名。無ければ通知しない |
+| `AGENT_DESK_URL` | Variable | 通知を押したときに開く画面（省略可） |
+| `AWS_ROLE_ARN`・`AWS_APPRUNNER_ACCESS_ROLE_ARN`・`AWS_REGION` | Variable | 公開先が `aws-apprunner` のとき（上の「AWS App Runner」） |
+| `EXPO_TOKEN` | Secret | 公開先が `expo` のとき |
+| `FACTORY_TOKEN`・`VERCEL_TOKEN` | Environment「factory」の Secret | 工場（1行から新しいサービスを作る）。ai-dev-template にだけ入れる（上の「工場」） |
+| `RETRY_TIMER` | Variable | `off` にすると、やり直しの目覚まし（retry-timer.yml）を使わない（定期の見張りだけでやり直す）。目覚ましは待つあいだランナーを使うので、公開していないリポジトリで Actions の時間を節約したいとき |
+| `NOTIFY_EVENTS` | Variable | 鳴らす通知の種類（カンマ区切り）。省略時は `stuck,question,hold,manual,deployed,deploy_failed,limit,intake,repeat_fail`。ほかに `merged`・`ci_failed` がある。種類の意味は `.github/scripts/notify.sh` |
+
+ほかに、Settings → General → Pull Requests の「Automatically delete head branches」をオンにする（マージ後のブランチが溜まらない。オンにしなくても、進行役がマージ後に `claude/*` ブランチを消し、見張り役が古い物を掃除する）。
+
+ほかに、GitHubの Claude アプリをこのリポジトリに入れる。テンプレートから作った最初の push で「Bootstrap」が自動で動き、ラベルを作り、`CLAUDE.md` から「ai-dev-template 自身の作業」の節を消し、診断（Doctor）の結果を実行画面の Summary に出す（ラベルがもうあれば何もしない）。❌ が出たら、Summary の「→」のとおり直し、Actions の「Doctor」をもう一度実行する。
+
+### パイプライン用の GitHub App の作り方（1回だけ）
+
+1. GitHub の Settings → Developer settings → GitHub Apps → **New GitHub App**
+2. 名前は好きに（例：`gaku-pipeline`）。Homepage URL はリポジトリのURLでよい。**Webhook の Active は外す**
+3. Repository permissions：Actions（Read）、Checks（Read）、Commit statuses（Read）、Contents（Read and write）、Issues（Read and write）、Pull requests（Read and write）、Workflows（Read and write）。Administration（Read）は任意（Doctor がブランチ削除の設定を見るのに使う）
+4. Where can this GitHub App be installed? は **Only on this account** → Create
+5. 出てきた **App ID** を、リポジトリの Variable `PIPELINE_APP_ID` に入れる
+6. ページ下の **Generate a private key** で .pem をダウンロードし、中身を Secret `PIPELINE_APP_PRIVATE_KEY` に入れる
+7. 左の **Install App** → このアカウントに Install → 使うリポジトリを選ぶ（ai-dev-template と、自動で配る先も全部）
+8. Doctor を実行して「GitHub App の鍵でこのリポジトリに書き込める」が出れば完了。`PIPELINE_TOKEN` は消してよい（残っていても App が優先）
+
+### 従来の方法：`PIPELINE_TOKEN`
+
+README の手順は GitHub App に一本化している。すでに Secret `PIPELINE_TOKEN` で動いている人は、そのまま動く（コードは変えていない。Doctor は ⚠️ で App への切り替えを勧めるだけ）。作るなら、GitHub の Settings → Developer settings → Fine-grained tokens で、このリポジトリだけを選び、Actions・Checks・Commit statuses を Read、Contents・Issues・Pull requests・Workflows を Read and write にする。回数制限をオーナーと共有し、期限がある。
+
+## 変えたい人向けの設定
+
+README には載せていない。どれも**入れなくても既定値で動く**。変えたいときだけ、Settings → Secrets and variables → Actions に入れる。
+
+| 名前 | 種類 | 既定値 | 意味 |
+| --- | --- | --- | --- |
+| `NOTIFY_EVENTS` | Variable | `stuck,question,hold,manual,deployed,deploy_failed,limit,intake,repeat_fail` | 鳴らす通知の種類（カンマ区切り）。ほかに `merged`・`ci_failed` がある。意味は `.github/scripts/notify.sh` |
+| `RETRY_TIMER` | Variable | 未設定＝on | `off` にすると、やり直しの目覚まし（`retry-timer.yml`）を使わず、定期の見張りだけでやり直す。公開していないリポジトリで Actions の時間を節約したいとき |
+| `VERCEL_DEPLOY_DELAY_MIN` | Variable | `3`（分） | main の CI が通ってから Vercel に公開するまで待つ分。待つ間にまたマージされれば新しい方だけ公開する（無料プランの「1日100回」対策） |
+| `SYNC_DELAY_MIN` | Variable | `15`（分） | テンプレート本体が、配り先への更新を配るまで待つ分（本体だけが使う） |
+| `AGENT_DESK_URL` | Variable | なし | 通知を押したときに開く画面（agent-desk）のアドレス。無ければ Issue・PR を開く |
+
+あとから足せる任意の設定：
+
+| 名前 | 種類 | 意味 |
+| --- | --- | --- |
+| `NTFY_TOPIC` | Secret | スマホ通知（ntfy アプリ）で購読するトピック名（好きな英数字）。無ければ通知しない（Doctor は ⚠️ を出すが、動く） |
+| `VERCEL_TEAM_ID` | Variable | Vercel をチームで使うときのチーム ID。個人のアカウントなら要らない |
+
+## 上級者向け
+
+README の3つ（Claude のトークン・GitHub App・Vercel）だけで動く。次の機能は消していない。要るときだけ読む。
+
+- 別の言語（Python・Go・Java・.NET など）と公開先の選び方：上の「言語と公開先（`pipeline.json`）」。Python（FastAPI）の見本は [examples/python/README.md](../examples/python/README.md)
+- AWS App Runner（Variable `AWS_ROLE_ARN` ほか）：「AWS App Runner」
+- Expo（スマホアプリ、Secret `EXPO_TOKEN`）：「Expo」
+- exe などの配布（`github-release`）とゲーム：「言語と公開先」の表と、「工場」の「ゲームのとき」（見本は [examples/game](../examples/game)・[examples/webgame](../examples/webgame)）
+- 会員と課金（Supabase・Stripe の saas）：「会員と課金（saas）」（見本は [examples/saas](../examples/saas)）
+- 1行から新しいサービスを作る工場（`FACTORY_TOKEN`・`VERCEL_TOKEN`）：「工場」と「最初の1回だけの準備」
+
+## main の保護を Bootstrap で自動化できるか（調べた結果。実装はしない）
+
+**結論：技術的には可能だが、いまは自動化せず、README の手順（手で1回）に残す。**
+
+- 保護の設定（`PUT /repos/{owner}/{repo}/branches/main/protection`）には、リポジトリの **Administration: Read and write** が要る。いまのパイプラインの鍵（GitHub App・`PIPELINE_TOKEN`）にはこの権限が無い（Administration は Doctor の読み取り用に任意で Read を足せるだけ）
+- 案A：パイプラインの App に Administration（Read and write）を足し、Bootstrap で保護を設定する。手間は最小だが、AI の作業に使う鍵が、保護の解除やリポジトリの設定変更までできるようになる。保護はまさに「AI を PR とレビューに通すための柵」なので、柵を外せる鍵を AI の近くに置くことになり、安全面で割に合わない
+- 案B：保護の設定だけ、別の強い鍵（工場の `FACTORY_TOKEN` のような Administration 付き）を Environment に入れ、main のワークフローからだけ使う。AI の作ったブランチからは読めないので案Aより安全。ただし、初めての人に「強い鍵をもう1つ作る」手順が増え、必須3つの方針に反する。工場（`factory.yml`）はこの形ですでにやっている
+- 判断：初めての人に増やす手間（強い鍵を作る）が、手で保護を1回設定する手間（Settings → Branches で1分）より大きい。Doctor が保護の有無を ⚠️ で教えるので、付け忘れも気づける。工場で作るリポジトリだけ案Bで自動化済み

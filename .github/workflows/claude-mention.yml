@@ -1,0 +1,167 @@
+# 差し戻し用：PRやIssueのコメントで「@claude 〜を直して」と書くとClaudeが対応する。
+name: Claude Mention
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  claude:
+    # 公開リポジトリでは誰でもコメントできるので、呼べるのはオーナー・メンバー・共同作業者と、
+    # パイプラインの App（ボット）だけ。AI自身（claude[bot]）は呼べない（自分で自分を呼ぶ繰り返しを防ぐ）
+    if: >-
+      contains(github.event.comment.body, '@claude') &&
+      (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) ||
+       (github.event.comment.user.type == 'Bot' && github.event.comment.user.login != 'claude[bot]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: claude-mention-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    env:
+      # 自動で直させる最後の1回（3回目）は、いちばん強いモデルで直す（依頼のコメントに印が付く）
+      MODEL: "${{ contains(github.event.comment.body, 'auto-fix-model: opus') && 'opus' || 'sonnet' }}"
+      MAX_TURNS: "${{ contains(github.event.comment.body, 'auto-fix-model: opus') && '60' || '40' }}"
+    steps:
+      # 履歴も全部取る（push の前に main を取り込むため。下の --append-system-prompt）
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      # あとで使う道具（PRのコードを動かしてよいかの判断・結果の記録）は、main の版を API で取ってくる。
+      # 作業フォルダの版は使わない：行へのコメント（pull_request_review_comment）で起きたときは、作業フォルダが最初からPRのコードで、
+      # AIのアクションもあとでPRのブランチに切り替える。PR（AI）が書き換えたスクリプトに、判断や記録をさせない
+      - name: 道具を main から取ってくる
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pipeline-tools"
+          for f in pipeline-lib ai-report denials step-log pr-trust notify; do
+            gh api -H "Accept: application/vnd.github.raw" "repos/$GITHUB_REPOSITORY/contents/.github/scripts/$f.sh?ref=$BASE" \
+              > "$RUNNER_TEMP/pipeline-tools/$f.sh" 2> /dev/null || rm -f "$RUNNER_TEMP/pipeline-tools/$f.sh"
+          done
+          # AIへの指示の部品（compose-prompt.sh と prompts/）も main の版を取る
+          for f in compose-prompt.sh prompts/base.md prompts/read-sections.md prompts/merge-main.md prompts/visual-tests.md prompts/visual-diff.md prompts/pr-body.md; do
+            mkdir -p "$(dirname "$RUNNER_TEMP/pipeline-tools/$f")"
+            gh api -H "Accept: application/vnd.github.raw" "repos/$GITHUB_REPOSITORY/contents/.github/scripts/$f?ref=$BASE" \
+              > "$RUNNER_TEMP/pipeline-tools/$f" 2> /dev/null || rm -f "$RUNNER_TEMP/pipeline-tools/$f"
+          done
+          chmod +x "$RUNNER_TEMP/pipeline-tools/"*.sh 2> /dev/null || true
+      # 言語の実行環境と依存を入れる（pipeline.json に合わせる。無ければ今までの Node 22・npm ci）
+      - name: 実行環境をそろえる
+        id: stack
+        uses: ./.github/actions/setup-stack
+      # 見た目のテストがあるアプリでは、AIも手元で見た目のテストを動かして確かめられるようにする（位置や数値を測るテストを直すため）
+      - name: 見た目のテストがあるか
+        id: visual
+        run: |
+          enabled=false
+          if [ -n "${{ steps.stack.outputs.node }}" ] && [ -f package.json ]; then
+            enabled=$(jq -r '.scripts["test:visual"] != null' package.json)
+          fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+          # AIに許すコマンド（見た目のテストを動かすだけ。基準の画像の撮り直しは --disallowedTools で止める）
+          if [ "$enabled" = true ]; then echo "allowed=Bash(npm run test:visual),Bash(npm run test:visual -- -g:*),Bash(npx playwright test:*)" >> "$GITHUB_OUTPUT"; else echo "allowed=" >> "$GITHUB_OUTPUT"; fi
+      - name: 見た目のテスト用のブラウザを入れる
+        if: steps.visual.outputs.enabled == 'true'
+        run: npx playwright install --with-deps chromium
+      # 見た目のテストが落ちていたら、差分の画像を .visual-diff/ に取ってくる（AI が見て、意図した変更か崩れかを決める。git には入れない）
+      - name: 見た目のテストの差分の画像を取ってくる
+        if: github.event.issue.pull_request || github.event.pull_request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: .github/scripts/fetch-visual-diff.sh
+      # パイプラインの App（ボット）がラベル・コメントで起こした実行を、AIのアクションが断らないようにする。
+      # AI自身（claude[bot]）は許さない（自分のコメントで自分を呼ぶ繰り返しを防ぐ）。Secret は使わない
+      - name: 起こしたボットを許可に入れる
+        id: bots
+        env:
+          SENDER: ${{ github.event.sender.login }}
+          SENDER_TYPE: ${{ github.event.sender.type }}
+        run: |
+          list=""
+          if [ "$SENDER_TYPE" = Bot ] && [ "$SENDER" != "claude[bot]" ]; then
+            list="${SENDER},${SENDER%\[bot\]}"
+          fi
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+      # AIのアクションは、PRの作者に書き込み権限が確認できないとき（ボットは必ずこの扱い）、npm・npx などのコマンドを、
+      # --allowedTools に入っていても拒否する（restrict_untrusted_prs）。パイプラインのPRは App（ボット）が作るので、
+      # そのままだと修正AIは確認コマンドを1つも動かせない。このリポジトリの claude/ ブランチのPRのときだけ、拒否を外す（pr-trust.sh）
+      - name: PRのコードを動かしてよいか決める
+        id: trust
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: bash "$RUNNER_TEMP/pipeline-tools/pr-trust.sh"
+      # 進捗ログ：自動の修正依頼（auto-fix）のときだけ、何回目かを残す
+      - name: 進捗ログ（修正・開始）
+        id: fixlog
+        if: ${{ contains(github.event.comment.body, '<!-- auto-fix') }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.issue.number || github.event.pull_request.number }}
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          pair=$(printf '%s' "$BODY" | grep -oE '自動の依頼 [0-9]+/[0-9]+' | tail -1 | grep -oE '[0-9]+/[0-9]+' || true)
+          n="${pair%%/*}"; max="${pair##*/}"
+          echo "attempt=${n:-1}" >> "$GITHUB_OUTPUT"
+          echo "max=${max:-3}" >> "$GITHUB_OUTPUT"
+          bash "$RUNNER_TEMP/pipeline-tools/step-log.sh" --pr "$PR" --step fix --model "$MODEL" --result running --attempt "${n:-1}" --max-attempts "${max:-3}"
+      # AIへの指示を部品から組む（main の版のスクリプトで。判定は作業フォルダ＝PRの中身で行う。docs/pipeline.md「指示を部品で組む」）
+      - name: AIへの指示を組む
+        id: prompt
+        run: |
+          text=$(bash "$RUNNER_TEMP/pipeline-tools/compose-prompt.sh" --mode mention --auto)
+          text=$(printf '%s' "$text" | tr -d '\n"')
+          echo "text=$text" >> "$GITHUB_OUTPUT"
+      - uses: anthropics/claude-code-action@v1
+        id: claude
+        with:
+          allowed_bots: ${{ steps.bots.outputs.list }}
+          restrict_untrusted_prs: ${{ steps.trust.outputs.restrict != 'false' }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: "--model ${{ env.MODEL }} --max-turns ${{ env.MAX_TURNS }} --allowedTools \"Bash(gh pr view:*),Bash(gh pr edit:*),Bash(gh issue view:*),Bash(gh pr comment:*),Bash(git fetch:*),Bash(git merge:*),Bash(git checkout --ours:*),Bash(git checkout --theirs:*),Bash(git status:*),Bash(git diff:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),${{ steps.stack.outputs.allowed }},${{ steps.visual.outputs.allowed }},Bash(.github/scripts/tests/run-all.sh),Bash(bash .github/scripts/tests/run-all.sh),Bash(shellcheck:*),Skill\" --disallowedTools \"Bash(npm run test:visual -- --update-snapshots:*),Bash(npm run test:visual -- -u:*),Bash(npx playwright test --update-snapshots:*),Bash(npx playwright test -u:*),Bash(git push --force:*),Bash(git push -f:*),Bash(git push --force-with-lease:*),Bash(git rebase:*)\" --append-system-prompt \"${{ steps.prompt.outputs.text }}\""
+      # 何が起きたかを、ログと Summary に残す（拒否された操作と、AIが最後に言ったこと）。写しておいた main の版を動かす
+      - name: AIの結果を残す
+        if: ${{ !cancelled() }}
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: bash "$RUNNER_TEMP/pipeline-tools/ai-report.sh" --title "修正AI" "$EXECUTION_FILE" || true
+      - name: 進捗ログ（修正・終了）
+        if: ${{ !cancelled() && steps.fixlog.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.issue.number || github.event.pull_request.number }}
+          RESULT: ${{ steps.claude.outcome == 'success' && 'success' || 'failure' }}
+          ATTEMPT: ${{ steps.fixlog.outputs.attempt }}
+          MAX: ${{ steps.fixlog.outputs.max }}
+        run: bash "$RUNNER_TEMP/pipeline-tools/step-log.sh" --pr "$PR" --step fix --model "$MODEL" --result "$RESULT" --attempt "$ATTEMPT" --max-attempts "$MAX"
+      # AIの実行記録を、データとして進行役（pipeline.yml の after-mention）に渡す。拒否された操作を読んで、次の動きを決めるのに使う
+      - name: AIの結果を取っておく
+        if: ${{ !cancelled() }}
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ai-result"
+          if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then cp "$EXECUTION_FILE" "$RUNNER_TEMP/ai-result/execution.json"; fi
+          touch "$RUNNER_TEMP/ai-result/.keep"
+      - uses: actions/upload-artifact@v6
+        if: ${{ !cancelled() }}
+        with:
+          name: ai-result
+          path: ${{ runner.temp }}/ai-result
+          include-hidden-files: true
+          retention-days: 3

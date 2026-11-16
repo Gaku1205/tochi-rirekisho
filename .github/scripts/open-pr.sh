@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# 実装AIのあと：ブランチ claude/issue-<番号>-... から main へのPRを自動で作る。
+# PRの本文は、実装AIがIssueに書いた「Create PR」リンクの中身を使う（無ければ Closes #番号 だけ）。
+#
+# 環境変数：ISSUE（番号）、ISSUE_TITLE、AI_OUTCOME（実装AIの結果 success/failure）、EXECUTION_FILE（AIの実行記録。失敗の原因の分類に使う）、
+#   CRITIQUE_FILE（任意：審査役が画面の画像だけを見て書いた採点。PRの本文に添える）
+source "$(dirname "$0")/pipeline-lib.sh"
+set -e
+
+# 作業中に Issue が閉じられたときは、PRを作らない（同じ作業のPRが2つになるのを防ぐ。ai-dev-template #84）
+if [ -n "${ISSUE:-}" ] && [ "$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE" --jq .state 2> /dev/null || echo open)" = closed ]; then
+  echo "#$ISSUE は閉じられているので、PRは作りません"
+  remove_label "$ISSUE" "ai:implement" 2> /dev/null || true
+  exit 0
+fi
+
+if ! has_pipeline_token; then
+  # トークンが無い間は、今までどおり人間がPRを作る
+  if [ "$AI_OUTCOME" = "success" ]; then
+    notify manual "PRを作れます" "#${ISSUE} ${ISSUE_TITLE}：AIの作業が終わりました" 4
+  else
+    notify manual "AIが止まりました" "#${ISSUE} ${ISSUE_TITLE}：結果を確認してPRを作ってください" 4
+  fi
+  exit 0
+fi
+
+# 実装AIは正常に終わったのに、変更が残っていないとき。理由を書かずに止めない：
+#   許可されていない操作が拒否されていた → 拒否された操作を書いて、1回だけ実装をやり直す（コメントが、やり直す実装AIへの手がかりになる）。
+#     やり直しても同じなら、足りない許可を書いて人間に回す。人間が ai:stuck を外して再開すると、また1回やり直せる
+#   拒否が無い → AIが最後に言ったことを書いて人間に回す（AIが「できない」と判断した、など）
+stop_or_retry_no_change() {
+  local what="$1" raw words note="" retried log
+  raw=$(denied_raw "${EXECUTION_FILE:-}")
+  words=$(ai_last_words "${EXECUTION_FILE:-}")
+  [ -n "$words" ] && note="AIが最後に言ったこと：「${words}」"
+  log="ログ：${GITHUB_SERVER_URL:-https://github.com}/${REPO}/actions/runs/${GITHUB_RUN_ID:-0}"
+  if [ -n "$raw" ]; then
+    retried=$(all_comments "$ISSUE" | jq --arg m "$PERM_RETRY_MARK" --arg resume "$RESUME_MARK" '
+      (map(select(.body | contains($resume)) | .created_at) | max // "") as $since
+      | [.[] | select((.body | contains($m)) and .created_at > $since)] | length')
+    if [ "${retried:-0}" -lt 1 ]; then
+      comment "$ISSUE" "🔁 実装AIは正常に終わりましたが、${what}。許可されていない操作が拒否されていたので、1回だけ自動でやり直します（${log}）。
+
+実装AIへ：前回は、次の操作が拒否されました：$(permission_list_short "$raw")。同じ操作は使わないでください。コマンドは1つずつ動かし、; や && や | でつながず、cd や 2>&1 も付けない。ファイルを読む・探すのは Read・Grep・Glob を使う。確認コマンドは、pipeline.json の checks（無ければ npm run typecheck・npm run lint・npm run test・npm run build）を、書かれたとおりの形で動かす。作業が終わったら、必ずコミットして push する。${note}
+
+${PERM_RETRY_MARK}"
+      remove_label "$ISSUE" "ai:implement"
+      add_label "$ISSUE" "ai:implement"
+      echo "#$ISSUE：${what}。拒否された操作（$(permission_list_short "$raw")）を書いて、1回だけ実装をやり直します"
+      return 0
+    fi
+    stop_issue_for_human "$ISSUE" "実装AIは正常に終わりましたが、${what}。1回自動でやり直しても、許可されていない操作が拒否されました：$(permission_list_short "$raw")（docs/pipeline.md の「AIの許可」の表と、ワークフローの --allowedTools を見てください）。${note}（${log}）"
+    report_permission_gap "$ISSUE" "$(denied_tools "${EXECUTION_FILE:-}")"
+    return 0
+  fi
+  stop_issue_for_human "$ISSUE" "実装AIは正常に終わりましたが、${what}（拒否された操作はありません）。${note:-AIが最後に言ったことは、実行記録にありません}（${log}）"
+}
+
+# いちばん新しいコミットがある claude/issue-<番号>- ブランチを探す
+branch=""
+latest=""
+for b in $(gh api "repos/$REPO/branches?per_page=100" --paginate -q ".[].name | select(startswith(\"claude/issue-${ISSUE}-\"))"); do
+  date=$(gh api "repos/$REPO/branches/$b" -q .commit.commit.committer.date)
+  if [[ "$date" > "$latest" ]]; then
+    latest="$date"
+    branch="$b"
+  fi
+done
+
+# 実装AIがエラーで終わって何も作れなかったときは、使用量の上限などの一時的な失敗かもしれないので、
+# 人間に回す前に自動でやり直す（watchdog.sh）。AIが正常に終わったのに変更が無いときは、AIの判断なので人間に回す
+if [ -z "$branch" ]; then
+  if [ "$AI_OUTCOME" != "success" ]; then
+    handle_ai_failure "$ISSUE" implement "実装AIが途中で止まり、変更が作られませんでした" "${EXECUTION_FILE:-}"
+  else
+    stop_or_retry_no_change "変更が作られませんでした（作業ブランチがありません）"
+  fi
+  exit 0
+fi
+
+ahead=$(gh api "repos/$REPO/compare/main...$branch" -q .ahead_by)
+if [ "${ahead:-0}" -eq 0 ]; then
+  if [ "$AI_OUTCOME" != "success" ]; then
+    handle_ai_failure "$ISSUE" implement "実装AIが途中で止まり、ブランチに変更がありません" "${EXECUTION_FILE:-}"
+  else
+    stop_or_retry_no_change "作業ブランチに変更がありません"
+  fi
+  exit 0
+fi
+
+existing=$(find_open_pr "$branch" || true)
+if [ -n "$existing" ]; then
+  echo "PRはもうあります：$existing"
+  remove_label "$ISSUE" "ai:retry"
+  exit 0
+fi
+
+# 実装AIの最後のコメントの「Create PR」リンクから、本文を取り出す
+comment=$(all_comments "$ISSUE" | jq -r 'map(select(.user.login == "claude[bot]")) | last | .body // ""')
+body=$(printf '%s' "$comment" | python3 -c '
+import re, sys, urllib.parse
+text = sys.stdin.read()
+m = re.search(r"quick_pull=1[^)\s]*", text)
+if m:
+    q = urllib.parse.parse_qs(m.group(0))
+    print(q.get("body", [""])[0])
+')
+if ! printf '%s' "$body" | grep -qiE "(close[sd]?|fix(e[sd])?|resolve[sd]?) #${ISSUE}\b"; then
+  body="Closes #${ISSUE}
+
+${body}"
+fi
+if [ -n "${CRITIQUE_FILE:-}" ] && [ -f "$CRITIQUE_FILE" ] && [ ! -L "$CRITIQUE_FILE" ]; then
+  body="${body}
+
+## 審査役（画面の画像だけを見る別のAI）の採点
+
+$(head -n 40 "$CRITIQUE_FILE" | cut -c1-500)"
+fi
+body="${body}
+
+---
+_実装AIの作業が終わったので、自動で作ったPRです。CIが通るとレビューAIが確認し、問題がなければ自動でマージします。_"
+
+created=$(gh api "repos/$REPO/pulls" -f title="$ISSUE_TITLE" -f head="$branch" -f base=main -f body="$body" -q .html_url)
+echo "PRを作りました：$created"
+remove_label "$ISSUE" "ai:retry"
+
+if [ "$AI_OUTCOME" != "success" ]; then
+  echo "実装AIは途中で止まりましたが（作業回数の上限など）、変更があるのでPRにしました。CIで確かめます"
+fi
