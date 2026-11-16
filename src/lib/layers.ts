@@ -126,19 +126,28 @@ export const ERA_INFO: Record<Era, EraInfo> = {
   },
 };
 
-/** public/tiles に入れてある範囲（大橋のまわり）。外は地理院から読む */
-const BUNDLED: { z: number; x0: number; x1: number; y0: number; y1: number }[] = [
-  { z: 14, x0: 14125, x1: 14130, y0: 6566, y1: 6570 },
-  { z: 15, x0: 28250, x1: 28260, y0: 13134, y1: 13140 },
-  { z: 16, x0: 56506, x1: 56513, y0: 26272, y1: 26278 },
-  { z: 16, x0: 56509, x1: 56517, y0: 26273, y1: 26281 },
-];
+type TileBox = { z: number; x0: number; x1: number; y0: number; y1: number };
 
-export function isBundled(z: number, x: number, y: number): boolean {
-  return BUNDLED.some((b) => b.z === z && x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1);
+/**
+ * public/tiles に実際に入れてある層と範囲（大橋のまわり）。層の id ごとに書く。
+ * ここに無い層・範囲は地理院から読む（同梱していない層を /tiles で指すと、画像が壊れる）。
+ */
+const BUNDLED: Record<string, TileBox[]> = {
+  gazo1: [
+    { z: 14, x0: 14125, x1: 14130, y0: 6566, y1: 6570 },
+    { z: 15, x0: 28250, x1: 28260, y0: 13134, y1: 13140 },
+    { z: 16, x0: 56506, x1: 56510, y0: 26272, y1: 26278 },
+    { z: 16, x0: 56509, x1: 56509, y0: 26279, y1: 26281 },
+  ],
+};
+
+export function isBundled(layerId: string, z: number, x: number, y: number): boolean {
+  return (BUNDLED[layerId] ?? []).some(
+    (b) => b.z === z && x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1,
+  );
 }
 
 export function tileUrl(layer: TileLayer, z: number, x: number, y: number): string {
-  if (isBundled(z, x, y)) return `/tiles/${layer.id}/${z}/${x}/${y}.${layer.localExt}`;
+  if (isBundled(layer.id, z, x, y)) return `/tiles/${layer.id}/${z}/${x}/${y}.${layer.localExt}`;
   return `https://cyberjapandata.gsi.go.jp/xyz/${layer.remote.name}/${z}/${x}/${y}.${layer.remote.ext}`;
 }

@@ -75,11 +75,11 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
             いま調べられる町：<span className="yr">{PLACES.length}</span>
           </p>
           <Link href="/" className="lost-example">
-            <StaticMap layer={ERA_INFO["1948"].layer} center={DEFAULT_PLACE.at} zoom={15.6} size={{ w: 480, h: 200 }}>
+            <StaticMap layer={ERA_INFO["1975"].layer} center={DEFAULT_PLACE.at} zoom={15} size={{ w: 480, h: 200 }}>
               <span className="map-pin" style={{ left: "50%", top: "50%" }} aria-hidden="true" />
             </StaticMap>
             <span className="plaque lost-example-cap">
-              例：大橋2丁目の<span className="yr">1948</span>年
+              例：大橋2丁目の<span className="yr">1975</span>年
             </span>
           </Link>
         </div>
