@@ -44,4 +44,63 @@ init_state '{"labels":{"3":["ai:plan"]}}'
 (cd "$work" && printf 'MOCKS\nPARALLEL\n' > plan-result.txt && ISSUE=3 PLAN_OUTCOME=success GH_TOKEN=pipe GITHUB_TOKEN_FOR_LABELS=x bash "$SCRIPTS_DIR/after-plan.sh" > /dev/null 2>&1)
 assert_eq "画面案の印" "ai:mocks" "$(labels_of 3)"
 
+
+echo "== ai:skip が付いた Issue（オーナー以外が作った物）は、失敗してもやり直しに回さず、結果も使わない"
+init_state '{"labels":{"3":["ai:plan","ai:skip"]}}'
+(cd "$work" && rm -f plan-result.txt && ISSUE=3 PLAN_OUTCOME=failure GITHUB_TOKEN_FOR_LABELS=x bash "$SCRIPTS_DIR/after-plan.sh" > /dev/null 2>&1)
+assert_eq "ai:retry を付けず、ai:plan を外す" "ai:skip" "$(labels_of 3)"
+init_state '{"labels":{"3":["ai:plan","ai:skip"]}}'
+run_plan "READY" > /dev/null
+assert_eq "清書できていても、実装に回さない" "ai:skip" "$(labels_of 3)"
+
+echo "== 企画AIが PARALLEL と言っても、企画の間に始まった作業と触るファイルが重なるなら、順番待ちにする"
+touch_state() { # この Issue の印 進行中の Issue の印
+  init_state '{"labels":{"3":["ai:plan"],"8":["ai:implement"]},"issues_meta":{"3":{"body":"本文\n<!-- ai-touches: '"$1"' -->"},"8":{"body":"本文\n<!-- ai-touches: '"$2"' -->"}}}'
+}
+touch_state "src/lib/a.ts, docs/spec.md" "src/lib/a.ts"
+out=$(run_plan "READY")
+assert_eq "重なるので順番待ち" "ai:queue" "$(labels_of 3)"
+assert_contains "理由をログに出す" "$out" "触るファイルが重なるので、待ちます"
+touch_state "src/lib/a.ts" "src/lib/b.ts"
+run_plan "READY" > /dev/null
+assert_eq "重ならなければ、今までどおり並列で実装へ" "ai:implement" "$(labels_of 3)"
+init_state '{"labels":{"3":["ai:plan"],"8":["ai:implement"]},"issues_meta":{"3":{"body":"本文\n<!-- ai-touches: src/lib/a.ts -->"}}}'
+run_plan "READY" > /dev/null
+assert_eq "進行中の物に印が無ければ、今までどおり企画AIの判断" "ai:implement" "$(labels_of 3)"
+
+echo "== 作業回数の上限に届いた企画：ワークフローが上限を増やしてやり直しても、また届いたら、やり直さず人間に回す"
+turns_file="$MOCK_DIR/turns.json"; printf '%s' '[{"type":"result","subtype":"error_max_turns","result":""}]' > "$turns_file"
+other_file="$MOCK_DIR/other.json"; printf '%s' '[{"type":"result","subtype":"error_during_execution","result":""}]' > "$other_file"
+limit_file="$MOCK_DIR/limit.json"; printf '%s' '[{"type":"result","subtype":"error_max_turns","result":"Claude usage limit reached|1900000000"}]' > "$limit_file"
+run_failed() { # 上限を増やしてやり直したか（true／false／空） 実行記録
+  (cd "$work" && rm -f plan-result.txt && ISSUE=3 PLAN_OUTCOME=failure PLAN_TURNS_RAISED="$1" EXECUTION_FILE="$2" GITHUB_TOKEN_FOR_LABELS=x bash "$SCRIPTS_DIR/after-plan.sh" 2>&1)
+}
+init_state '{"labels":{"3":["ai:plan"]}}'
+run_failed true "$turns_file" > /dev/null
+assert_eq "人間に回す（ai:plan は外す。やり直し待ちにしない）" "ai:stuck" "$(labels_of 3)"
+assert_contains "理由を書く" "$(comments_of 3)" "作業回数の上限を増やしてやり直しても、また上限に届きました"
+assert_contains "次にすることを書く" "$(comments_of 3)" "Issue を小さく分けるか"
+assert_not_contains "やり直しの記録は作らない" "$(comments_of 3)" "auto-retry"
+
+echo "== 上限を増やしたやり直しをしていない（古いワークフロー・結果ファイルがあった）ときは、今までどおり1回やり直す"
+for raised in false ""; do
+  init_state '{"labels":{"3":["ai:plan"]}}'
+  run_failed "$raised" "$turns_file" > /dev/null
+  assert_eq "やり直し待ち（raised=${raised:-空}）" "ai:plan,ai:retry" "$(labels_of 3)"
+done
+
+echo "== 上限を増やしたやり直しが、別の理由（エラー・使用量の上限）で終わったときは、今までどおりやり直す"
+init_state '{"labels":{"3":["ai:plan"]}}'
+run_failed true "$other_file" > /dev/null
+assert_eq "エラー：やり直し待ち" "ai:plan,ai:retry" "$(labels_of 3)"
+init_state '{"labels":{"3":["ai:plan"]}}'
+run_failed true "$limit_file" > /dev/null
+assert_eq "使用量の上限：待つ（人間に回さない）" "ai:plan,ai:retry" "$(labels_of 3)"
+assert_contains "上限の待ちとして記録する" "$(comments_of 3)" "limit-until=1900000000"
+
+echo "== 上限を増やしたやり直しで清書できたら、いつもどおり実装へ"
+init_state '{"labels":{"3":["ai:plan"]}}'
+(cd "$work" && printf '%s\n%s\n' "READY" PARALLEL > plan-result.txt && ISSUE=3 PLAN_OUTCOME=success PLAN_TURNS_RAISED=true EXECUTION_FILE="$turns_file" GITHUB_TOKEN_FOR_LABELS=x bash "$SCRIPTS_DIR/after-plan.sh" > /dev/null 2>&1)
+assert_eq "ai:implement" "ai:implement" "$(labels_of 3)"
+
 finish

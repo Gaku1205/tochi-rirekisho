@@ -24,11 +24,17 @@ VISUAL_MARK="<!-- auto-visual-update -->"
 # 他の Issue・PR の完了待ち（ai:blocked）で、待ち先を書くコメントの印（待ち先ごとに1つ：<!-- blocked-by: owner/repo#N -->）
 # shellcheck disable=SC2034  # after-plan.sh・watchdog.sh で使う
 BLOCKED_MARK_RE='<!-- blocked-by: ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+) -->'
+# レビューAIが動けないPR（レビューのワークフロー自体を変えるPR）を、人間のマージ待ちにした印（after-review.sh が書き、watchdog.sh が「待っている」と読む）
+# 先頭コミットごとに書く：<!-- review-unavailable: 先頭コミット -->（新しいコミットが入れば、もう一度確かめる）
+# shellcheck disable=SC2034  # after-review.sh・watchdog.sh で使う
+REVIEW_UNAVAILABLE_MARK="review-unavailable:"
 # shellcheck disable=SC2034  # after-ci.sh で使う
 PIPELINE_TEST_MARK="<!-- auto-pipeline-test-rerun -->"
 # 自動でやり直す回数の上限と、失敗してからやり直すまでの待ち時間（分）。
 # 使用量の上限で止まったときは、リセットされるまで何度かやり直しながら待つ
 RETRY_MARK="<!-- auto-retry -->"
+# 人間が再開したとき（resume.sh）に、やり直しの記録に書く理由。write_retry_record が、この文のときだけ「回数を0に戻しました」と書く
+RESUMED_REASON="人間が再開しました"
 MAX_RETRY="${MAX_RETRY:-10}"
 RETRY_COOLDOWN_MIN="${RETRY_COOLDOWN_MIN:-30}"
 # 使用量の上限で止まったときは、回数を減らさずに待つ。リセット時刻が分からないときの待ち時間（分）と、待つのをあきらめる上限（時間）
@@ -77,6 +83,13 @@ all_comments() {
   gh api "repos/$REPO/issues/$1/comments?per_page=100" --paginate --slurp | jq 'add // []'
 }
 
+# 一覧（配列を返す API）を全部、ページをまたいで1つの配列で出す。使い方：api_list "repos/$REPO/issues?state=open&per_page=100"
+# 100件までなら API は今までどおり1回（2ページ目からは、続きがあるときだけ読む）。per_page=100 だけだと、101件目からが黙って見えなくなる。
+# 全体の件数・並べ替えが要るときは、これを使う（gh api --paginate -q は、ページごとに jq を当てるので、件数や並べ替えがページごとになる）
+api_list() {
+  gh api "$1" --paginate --slurp | jq -c 'add // []'
+}
+
 # 基準の画像を自動で撮り直した回数（上限の数え方）。
 # 数えるのは、PRに main を最後に取り込んだ後（と、人間が ai:stuck を外して続きを頼んだ後）の撮り直しだけ。
 # main を取り込むとき、基準の画像のコンフリクトは main の側を取る決まりなので、それより前の撮り直しは消えている。
@@ -97,12 +110,12 @@ issue_title() {
 
 # ラベルが付いたopenのIssue（PRを除く）の数
 count_open_issues_with_label() {
-  gh api "repos/$REPO/issues?state=open&per_page=100&labels=$(urlencode "$1")" \
-    -q '[.[] | select(.pull_request | not)] | length'
+  api_list "repos/$REPO/issues?state=open&per_page=100&labels=$(urlencode "$1")" \
+    | jq '[.[] | select(.pull_request | not)] | length'
 }
 
 count_open_prs() {
-  gh api "repos/$REPO/pulls?state=open&per_page=100" -q 'length'
+  api_list "repos/$REPO/pulls?state=open&per_page=100" | jq 'length'
 }
 
 # ブランチ名からopenのPRを1つ探す。見つかれば「番号 先頭コミット」を出す
@@ -122,6 +135,16 @@ linked_issue() {
     n=$(printf '%s' "$branch" | sed -nE 's#^claude/issue-([0-9]+)-.*#\1#p')
   fi
   printf '%s' "$n"
+}
+
+# Issue を作った人を、そのまま自動で動かしてよいか：オーナーと、このパイプラインのワークフロー（企画AIが分けて作る Issue は
+# github-actions[bot]、AI自身は claude[bot]）だけ。公開リポジトリでは誰でも Issue を作れるので、ほかの人・ほかのボットの Issue は
+# オーナーが ai:skip を外すまで動かさない（intake.sh・watchdog.sh）
+trusted_author() {
+  case "${1,,}" in
+    "${OWNER,,}" | "claude[bot]" | "github-actions[bot]") return 0 ;;
+  esac
+  return 1
 }
 
 # まだパイプラインに乗っていないIssueか（ai: で始まるラベルが1つも無い。ai:skip も ai: なので「まだ動かさない」になる）
@@ -205,6 +228,24 @@ ${AUTO_FIX_MARK}
 }
 
 # PR のマージの状態（GitHub が計算し終わるまで少し待つ）：clean / dirty（main と衝突）/ blocked / behind / unknown など
+# もう一度レビューに回す（ai:review を付け直すと、labeled イベントでレビューAIが動く）。
+# ただし main とコンフリクトしているPRでは、GitHub が pull_request のワークフローを動かさないので、レビューAIは起きない。
+# そのまま付け直すと誰も動かずに止まる（tochi-rirekisho PR #5：PRの説明を直した後のレビューが起きず、9時間止まった）。
+# コンフリクトしていれば、先にAIに解消させる（直す回数に数える。解消して push されると、CIのあとでレビューに回る）
+# shellcheck disable=SC2016 # 文の中の `…` はそのまま見せる（コマンドとして動かさない）
+CONFLICT_FIX_MSG='main とコンフリクトしていて、このままではCIもレビューも動きません。`git fetch origin main` のあと `git merge origin/main` でコンフリクトを解消してください。両方の変更の意図を残し、どちらかを捨てるときはPRにコメントで理由を書いてください。解消したら確認コマンド（pipeline.json の checks。無ければ型チェック・リント・テスト・ビルド）を全部通して push してください。'
+request_review() { # PR番号
+  local pr="$1" sha
+  if [ "$(pr_merge_state "$pr")" = dirty ]; then
+    sha=$(gh api "repos/$REPO/pulls/$pr" -q .head.sha)
+    request_fix_or_stop "$pr" "$sha" "$CONFLICT_FIX_MSG"
+    echo "PR #$pr：main とコンフリクトしていてレビューが動かないので、先にAIに解消を依頼しました"
+    return 0
+  fi
+  remove_label "$pr" "ai:review" 2> /dev/null || true
+  add_label "$pr" "ai:review"
+}
+
 pr_merge_state() {
   local pr="$1" i state=""
   for i in 1 2 3 4 5; do
@@ -215,11 +256,31 @@ pr_merge_state() {
   echo "${state:-unknown}"
 }
 
+# PRをマージする。GitHub の一時的なエラー（502 などのサーバー側のエラー・通信の失敗）なら、少し待って3回まで試す
+# （1回の 502 で、配られたパイプラインの更新が人間待ちになったことがある。tap-stack-rush #37）。
+#   使い方：merge_pr PR番号 先頭コミット。マージできたら 0。できなければ 1 で、標準出力に最後のエラーの文
+merge_pr() {
+  local pr="$1" sha="$2" out="" i
+  for i in 1 2 3; do
+    if out=$(gh api -X PUT "repos/$REPO/pulls/$pr/merge" -f merge_method=merge -f sha="$sha" 2>&1); then
+      return 0
+    fi
+    # エラーが返っても、マージ自体は済んでいることがある
+    if [ "$(gh api "repos/$REPO/pulls/$pr" -q '.merged // false' 2> /dev/null)" = true ]; then
+      return 0
+    fi
+    printf '%s' "$out" | grep -qiE 'HTTP 5[0-9][0-9]|server error|bad gateway|timeout|timed out|connection' || break
+    [ "$i" -lt 3 ] && sleep "${MERGE_RETRY_WAIT_SEC:-10}"
+  done
+  printf '%s' "$out"
+  return 1
+}
+
 # 自動でマージする。できなかったら黙って終わらず、main との衝突なら AI に解消させ、それ以外はやり直し待ちに回す。
-#   使い方：merge_or_handle PR番号 先頭コミット 種類（mark_for_retry に渡す）。マージできたら 0、できなければ 1
+#   使い方：merge_or_handle PR番号 先頭コミット 種類（mark_for_retry に渡す。merge なら、見張り役はAIを動かさずにマージだけをやり直す）。マージできたら 0、できなければ 1
 merge_or_handle() {
   local pr="$1" sha="$2" kind="$3" out state
-  if out=$(gh api -X PUT "repos/$REPO/pulls/$pr/merge" -f merge_method=merge -f sha="$sha" 2>&1); then
+  if out=$(merge_pr "$pr" "$sha"); then
     return 0
   fi
   state=$(pr_merge_state "$pr")
@@ -228,10 +289,105 @@ merge_or_handle() {
     request_fix_or_stop "$pr" "$sha" "レビューのあとに main が進み、コンフリクトでマージできませんでした。\`git fetch origin main\` のあと \`git merge origin/main\` でコンフリクトを解消してください。両方の変更の意図を残し（docs/spec.md・docs/design.md も両方の決まりを残す）、どちらかを捨てるときはPRにコメントで理由を書いてください。解消したら確認コマンド（pipeline.json の checks。無ければ型チェック・リント・テスト・ビルド）を全部通して push してください。"
     echo "PR #$pr：main と衝突してマージできないので、AIに解消を依頼しました"
   else
-    mark_for_retry "$pr" "$kind" "自動でマージできませんでした（状態：${state}。$(printf '%s' "$out" | tail -n 1 | cut -c1-160)）"
-    echo "PR #$pr：マージできなかったので、やり直し待ちにしました（状態：${state}）"
+    # CI 以外のチェック（Vercel など）が落ちていて、GitHub がマージを断ったのかもしれない。落ちているチェックがあれば、名前と理由を書く
+    local ext err
+    err="$(printf '%s' "$out" | tail -n 1 | cut -c1-160)"
+    ext=$(external_checks_not_ok "$sha")
+    if [ -n "$ext" ]; then
+      handle_external_checks "$pr" "$sha" "$ext" "自動でマージできませんでした（状態：${state}。${err}）"
+    else
+      mark_for_retry "$pr" "$kind" "自動でマージできませんでした（状態：${state}。${err}）"
+      echo "PR #$pr：マージできなかったので、やり直し待ちにしました（状態：${state}）"
+    fi
   fi
   return 1
+}
+
+# ---- CI 以外のチェック（Vercel などの外部のサービスが、PRの先頭コミットに付ける物） ----
+# CI（GitHub Actions）もレビューも通ったのに、外部のチェックが落ちている・終わっていないと、マージできない。
+# 黙って止まらないように、落ちているチェックの名前と理由をPRに書き、時間をおいてもう一度確かめる（AIは動かさない。
+# やり直しの種類 merge。見張り役が after-review.sh のマージの判断だけをやり直す）。続くなら人間に回す
+EXTERNAL_CHECK_MARK="external-checks:"
+# 同じ先頭コミットで、確かめ直す回数（これだけ確かめても通らなければ人間に回す）
+EXTERNAL_CHECK_RETRIES="${EXTERNAL_CHECK_RETRIES:-2}"
+
+# 読むだけの API：ワークフローのトークン（READ_TOKEN。checks: read・statuses: read）で読み、読めなければパイプラインの鍵で読む
+read_api() {
+  if [ -n "${READ_TOKEN:-}" ] && GH_TOKEN="$READ_TOKEN" gh api "$@" 2> /dev/null; then return 0; fi
+  gh api "$@" 2> /dev/null
+}
+
+# check run の一覧（JSON の配列）から、CI 以外（GitHub Actions 以外の App が付けた物）で通っていない物を出す。形は下と同じ
+external_check_runs_not_ok() {
+  jq -r '.[] | select((.app.slug // "") != "github-actions")
+    | select(.status != "completed" or (.conclusion | IN("success", "neutral", "skipped") | not))
+    | (.status != "completed") as $pending
+    | ["check", (.name // "?"), (if $pending then "pending" else "failed" end),
+       ((if $pending then (.status // "") else (.conclusion // "") end)
+        + (if (.output.title // "") != "" then "：" + .output.title else "" end) | gsub("[\t\r\n]"; " ") | .[0:140]),
+       (.details_url // .html_url // "")] | @tsv' 2> /dev/null || true
+}
+
+# 先頭コミットの「CI 以外のチェック」のうち、通っていない物を1行に1つ出す（無ければ何も出さない。読めなければ、無いとみなす）。
+#   タブ区切り：種類（check＝check run／status＝コミットステータス） 名前 状態（failed／pending） 理由 URL
+#   第2引数に check run の一覧（JSON の配列）を渡すと、check run は読み直さない
+external_checks_not_ok() {
+  local sha="$1" runs="${2:-}"
+  if [ -z "$runs" ]; then
+    runs=$(read_api "repos/$REPO/commits/$sha/check-runs?per_page=100" -q '[.check_runs[] | select(.name != "review")]') || runs="[]"
+  fi
+  printf '%s' "$runs" | external_check_runs_not_ok
+  read_api "repos/$REPO/commits/$sha/status?per_page=100" -q '.statuses // [] | .[] | select(.state != "success")
+    | ["status", (.context // "?"), (if .state == "pending" then "pending" else "failed" end),
+       ((.state // "") + (if (.description // "") != "" then "：" + .description else "" end) | gsub("[\t\r\n]"; " ") | .[0:140]),
+       (.target_url // "")] | @tsv' || true
+}
+
+# 通っていないチェックの一覧（上の形）を、コメントに書く箇条書きにする
+external_checks_text() {
+  local kind name state why url line
+  while IFS=$'\t' read -r kind name state why url; do
+    [ -z "$name" ] && continue
+    line="- \`${name}\`（$([ "$kind" = status ] && echo "コミットステータス" || echo "check run")）：$([ "$state" = pending ] && echo "まだ終わっていません" || echo "落ちています")"
+    [ -n "$why" ] && line="${line}（${why}）"
+    [ -n "$url" ] && line="${line} ${url}"
+    printf '%s\n' "$line"
+  done <<< "$1"
+}
+
+# 通っていないチェックの名前を「、」でつなぐ（理由の1行用）
+external_checks_names() {
+  printf '%s\n' "$1" | cut -f2 | grep -v '^$' | awk '!seen[$0]++' | paste -sd, - | sed 's/,/、/g'
+}
+
+# CI 以外のチェックが通っていないとき：名前と理由をPRに書いて、やり直し待ち（種類 merge）にする。
+# 同じ先頭コミットで EXTERNAL_CHECK_RETRIES 回確かめ直しても通らなければ、人間に回す（人間が再開したら、数え直す）
+#   使い方：handle_external_checks PR番号 先頭コミット 一覧（external_checks_not_ok の出力） [マージの失敗の文]
+handle_external_checks() {
+  local pr="$1" sha="$2" list="$3" merge_err="${4:-}" names text n lead
+  names=$(external_checks_names "$list")
+  text=$(external_checks_text "$list")
+  n=$(all_comments "$pr" | jq --arg mk "<!-- ${EXTERNAL_CHECK_MARK} ${sha} -->" --arg resume "$RESUME_MARK" '
+    (map(select(.body | contains($resume)) | .created_at) | max // "") as $since
+    | [.[] | select((.body | contains($mk)) and .created_at > $since)] | length')
+  lead="CI（GitHub Actions）とレビューは通りましたが、CI 以外のチェックが通っていません"
+  [ -n "$merge_err" ] && lead="${merge_err}。CI 以外のチェックが通っていません"
+  if [ "${n:-0}" -ge "$EXTERNAL_CHECK_RETRIES" ]; then
+    stop_for_human "$pr" "${lead}（${names}）。時間をおいて${n}回確かめ直しても、変わりませんでした。チェックを付けたサービスの側（Vercel などの画面）を確かめてください。直ったら \`ai:stuck\` を外すと、続きから進みます
+
+${text}"
+    echo "PR #$pr：CI 以外のチェック（${names}）が通らないままなので、人間に回しました"
+    return 0
+  fi
+  comment "$pr" "⏳ ${lead}。まだマージしません。
+
+${text}
+
+一時的な失敗・まだ途中かもしれないので、時間をおいてもう一度確かめます（$((n + 1))/${EXTERNAL_CHECK_RETRIES}回目。AIは動かしません）。それでも通らなければ、人間に回します。
+
+<!-- ${EXTERNAL_CHECK_MARK} ${sha} -->" || true
+  mark_for_retry "$pr" merge "CI 以外のチェックが通っていません（${names}）"
+  echo "PR #$pr：CI 以外のチェック（${names}）が通っていないので、時間をおいて確かめ直します"
 }
 
 # ---- 順番待ち（ai:queue）を進める ----
@@ -277,8 +433,8 @@ repo_has_visual_tests() {
 inflight_touches() {
   local n body t pr files impl pulls
   # 一覧を読めなかったら、分からない物があるとして待つ（空の一覧とみなさない）
-  impl=$(gh api "repos/$REPO/issues?state=open&per_page=100&labels=ai%3Aimplement" -q '.[] | select(.pull_request | not) | .number' 2> /dev/null) || { echo unknown; return 0; }
-  pulls=$(gh api "repos/$REPO/pulls?state=open&per_page=100" -q '.[] | "\(.number) \(.head.ref)"' 2> /dev/null) || { echo unknown; return 0; }
+  impl=$(gh api "repos/$REPO/issues?state=open&per_page=100&labels=ai%3Aimplement" --paginate -q '.[] | select(.pull_request | not) | .number' 2> /dev/null) || { echo unknown; return 0; }
+  pulls=$(gh api "repos/$REPO/pulls?state=open&per_page=100" --paginate -q '.[] | "\(.number) \(.head.ref)"' 2> /dev/null) || { echo unknown; return 0; }
   for n in $impl; do
     # PRがもうあれば、PRの変えたファイルで数える（下）
     if printf '%s\n' "$pulls" | grep -q " claude/issue-$n-"; then continue; fi
@@ -287,7 +443,7 @@ inflight_touches() {
     if [ -z "$t" ]; then echo unknown; else printf '%s\n' "$t"; fi
   done
   for pr in $(printf '%s\n' "$pulls" | cut -d' ' -f1); do
-    files=$(gh api "repos/$REPO/pulls/$pr/files?per_page=100" -q '.[].filename' 2> /dev/null) || { echo unknown; continue; }
+    files=$(gh api "repos/$REPO/pulls/$pr/files?per_page=100" --paginate -q '.[].filename' 2> /dev/null) || { echo unknown; continue; }
     printf '%s\n' "$files"
   done
 }
@@ -303,8 +459,9 @@ start_next_in_queue() {
   stuck=$(count_open_issues_with_label "ai:stuck") || return 1
   prs=$(count_open_prs) || return 1
   echo "実装中 ${busy} / 停止中 ${stuck}（数えない） / openのPR ${prs}（並列の上限 ${MAX_PARALLEL}）"
-  queue=$(gh api "repos/$REPO/issues?state=open&per_page=100&labels=ai%3Aqueue" \
-    -q '[.[] | select(.pull_request | not) | {n: .number, p: ([.labels[].name] | index("priority:high") != null)}] | sort_by((if .p then 0 else 1 end), .n) | .[].n') || return 1
+  # 並べ替えは全体でする（ページごとに並べると、2ページ目の急ぎ・番号の小さい物が後ろに回る）
+  queue=$(api_list "repos/$REPO/issues?state=open&per_page=100&labels=ai%3Aqueue" \
+    | jq -r '[.[] | select(.pull_request | not) | {n: .number, p: ([.labels[].name] | index("priority:high") != null)}] | sort_by((if .p then 0 else 1 end), .n) | .[].n') || return 1
   if [ -z "$queue" ]; then
     echo "順番待ちはありません"
     return 0
@@ -364,7 +521,7 @@ start_queued_issue() {
 # ---- 自動のやり直し ----
 # 止まったとき、すぐ人間に回さず「あとでやり直す」印（ai:retry）と記録のコメントを付ける。
 # やり直しは watchdog.sh（定期・ほかのワークフロー完了のたび）が、待ち時間（RETRY_COOLDOWN_MIN）が過ぎてから行う。
-# 上限（MAX_RETRY）を超えたら人間に回す。kind：plan / implement（Issue）、review / mention（PR）
+# 上限（MAX_RETRY）を超えたら人間に回す。kind：plan / implement / mocks（Issue）、review / mention（PR）
 
 retry_comment() {
   all_comments "$1" | jq -c --arg mark "$RETRY_MARK" 'map(select(.body | contains($mark))) | last // empty'
@@ -389,7 +546,8 @@ write_retry_record() {
 <!-- limit-until=${until_at} -->"
   [ -n "$first" ] && marks="${marks}
 <!-- limit-first=${first} -->"
-  if [ "$count" -eq 0 ]; then
+  # 最初の失敗も回数は 0 なので、回数だけでは見分けない（見分けないと、最初の失敗が「回数を0に戻しました」と出て、理由の行も残らない）
+  if [ "$count" -eq 0 ] && [ "$reason" = "$RESUMED_REASON" ]; then
     # 人間が再開したとき（resume.sh）：回数を0に戻しただけ。「AIが止まった」とは書かない
     body=$(printf '▶ %s。自動のやり直しの回数を0に戻しました。\n\n%s\n<!-- count=0 kind=%s -->%s' "$reason" "$RETRY_MARK" "$kind" "$marks")
   else
@@ -454,6 +612,14 @@ classify_failure() {
   else
     echo "その他（結果が読み取れません）"
   fi
+}
+
+# AIの実行記録が「作業回数の上限（--max-turns）に届いて終わった」か
+hit_max_turns() {
+  local f="${1:-}" subtype
+  { [ -n "$f" ] && [ -s "$f" ]; } || return 1
+  subtype=$(jq -r 'if type == "array" then . else [.] end | map(select(type == "object" and .type == "result")) | last // {} | .subtype // ""' "$f" 2> /dev/null) || return 1
+  [ "$subtype" = "error_max_turns" ]
 }
 
 # 失敗コメントの理由に、分類（classify_failure）と、見に行けるログのURLを足す
@@ -588,7 +754,9 @@ AIが \`${key}\` を許可されておらず、${n}回止まりました（記�
 handle_ai_failure() {
   local num="$1" kind="$2" label="$3" file="${4:-}" denied reason
   denied=$(denied_tools "$file")
-  if [ -n "$denied" ]; then
+  # 使用量の上限で止まったのなら、途中に拒否された操作があっても、許可の不足として人間に回さない（上限は待てば直る。
+  # 拒否は、AIが別のやり方で先へ進めていることが多い）。上限のリセットを待ってやり直す（retry_ai_failure）
+  if [ -n "$denied" ] && [ -z "$(limit_signal "$file")" ]; then
     reason="$(failure_reason "$label" "$file")。足りない許可：$(permission_list_short "$denied")（docs/pipeline.md の「AIの許可」の表と、ワークフローの --allowedTools を見てください）"
     # 先に人間に回す（ラベル・コメント・通知）。記録は後。記録が遅くてジョブが時間切れになっても、宙に浮かないように
     case "$kind" in
@@ -599,7 +767,39 @@ handle_ai_failure() {
     report_permission_gap "$num" "$denied"
     return 0
   fi
-  mark_for_retry "$num" "$kind" "$(failure_reason "$label" "$file")" "$(limit_signal "$file")"
+  retry_ai_failure "$num" "$kind" "$label" "$file"
+}
+
+# AIがエラーで終わったとき、やり直し待ち（ai:retry）にする。実行記録があれば、原因に合わせる：
+#   使用量の上限        → リセットまで待つ（やり直しの回数を使わない）
+#   作業回数の上限が続く → やり直さず人間に回す（max_turns_again）
+#   それ以外            → 30分あけてやり直す
+# 使い方：retry_ai_failure 番号 kind(plan|implement|review|mention) 説明 [実行記録のファイル]
+retry_ai_failure() {
+  local num="$1" kind="$2" label="$3" file="${4:-}" limit reason
+  limit=$(limit_signal "$file")
+  if [ -z "$limit" ] && max_turns_again "$num" "$file"; then
+    reason="$(failure_reason "$label" "$file")。やり直しても、また作業回数の上限に届きました（同じ上限で何度やり直しても、同じ所で止まります）。作業が大きすぎるかもしれません"
+    case "$kind" in
+      plan) remove_label "$num" "ai:plan"; stop_issue_for_human "$num" "${reason}。Issue を小さく分けてください" ;;
+      implement) stop_issue_for_human "$num" "${reason}。Issue を小さく分けるか、\`size:L\` を付けてから \`ai:stuck\` を外してください" ;;
+      *) stop_for_human "$num" "${reason}。PRのコメントとログを確かめてください" ;;
+    esac
+    return 0
+  fi
+  mark_for_retry "$num" "$kind" "$(failure_reason "$label" "$file")" "$limit"
+}
+
+# AIが作業回数の上限（--max-turns）で止まり、もう MAX_TURNS_RETRY 回やり直した後か。
+# 同じ上限のままやり直しても同じ所で止まるので、10回やり直す前に人間に回すのに使う（やり直しのたびに、上限いっぱいまでAIを使うため）
+#   使い方：max_turns_again 番号 実行記録のファイル
+MAX_TURNS_RETRY="${MAX_TURNS_RETRY:-1}"
+max_turns_again() {
+  local num="$1" f="${2:-}" subtype
+  { [ -n "$f" ] && [ -s "$f" ]; } || return 1
+  subtype=$(jq -r 'if type == "array" then . else [.] end | map(select(type == "object" and .type == "result")) | last // {} | .subtype // ""' "$f" 2> /dev/null) || return 1
+  [ "$subtype" = "error_max_turns" ] || return 1
+  [ "$(retry_count "$num")" -ge "$MAX_TURNS_RETRY" ]
 }
 
 # 止まったことを記録して、あとで自動でやり直す。使い方：mark_for_retry 番号 kind 理由 [limit]
@@ -627,7 +827,7 @@ mark_for_retry() {
       remove_label "$num" "ai:plan"
     fi
     case "$kind" in
-      plan | implement) stop_issue_for_human "$num" "${reason}。自動でやり直しても${MAX_RETRY}回解決しませんでした" ;;
+      plan | implement | mocks) stop_issue_for_human "$num" "${reason}。自動でやり直しても${MAX_RETRY}回解決しませんでした" ;;
       *) stop_for_human "$num" "${reason}。自動でやり直しても${MAX_RETRY}回解決しませんでした" ;;
     esac
     return
@@ -656,7 +856,7 @@ REPEAT_ALERT_AT="${REPEAT_ALERT_AT:-2}"
 alert_if_repeated_failures() {
   local num="$1" reason="$2" now n c body updated recent=0 list=""
   now=$(date +%s)
-  for n in $(gh api "repos/$REPO/issues?state=open&labels=ai%3Aretry&per_page=100" -q '.[].number' 2> /dev/null); do
+  for n in $(gh api "repos/$REPO/issues?state=open&labels=ai%3Aretry&per_page=100" --paginate -q '.[].number' 2> /dev/null); do
     c=$(retry_comment "$n")
     [ -z "$c" ] && continue
     body=$(printf '%s' "$c" | jq -r '.body // ""')
@@ -726,7 +926,7 @@ ci_failed_steps() {
 # 基準の画像の撮り直しを頼んでいる言い方（AIの返事・レビューの指摘・PRの説明のどれかにあれば、撮り直しが要る）
 VISUAL_HINT_RE='visual:update|基準の?画像.{0,60}(古|撮り直|更新|差し替)|(撮り直|更新|差し替).{0,60}基準の?画像|スナップショット.{0,60}(古|撮り直|更新)|update-snapshots'
 # 「指摘が間違い・直す必要が無い」と返している言い方
-DISAGREE_HINT_RE='指摘は.{0,40}(誤り|間違|当たら|該当しな|不要)|(直す|修正の?|変更の?)必要(は|が|も)(ない|無い|ありません)|(修正|変更|対応)(は)?不要|直さず|直しません|直さない|false positive|not (a )?(real )?(bug|issue|problem)'
+DISAGREE_HINT_RE='指摘は.{0,40}(誤り|間違|当たら|該当しな|不要)|(前回|前の|これまで)の?(対応|修正|直し)で.{0,30}(直し|対応|修正)?(済み|ずみ|ました)|(すでに|既に).{0,20}(直し|対応|修正|書かれ|入っ)(て|済)|(直し|対応|修正)済み|already (fixed|addressed|done)|(直す|修正の?|変更の?)必要(は|が|も)(ない|無い|ありません)|(修正|変更|対応)(は)?不要|直さず|直しません|直さない|false positive|not (a )?(real )?(bug|issue|problem)'
 # 許可の拒否で、1回だけ自動でやり直した印（2回目は人間に回す）
 # shellcheck disable=SC2034  # after-mention.sh で使う
 PERM_RETRY_MARK="<!-- auto-perm-retry -->"
