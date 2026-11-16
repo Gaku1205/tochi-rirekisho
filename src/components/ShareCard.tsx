@@ -7,6 +7,8 @@ import { CARD, sheetCrop, wrapText } from "@/lib/card";
 import { OLD_MAP } from "@/lib/layers";
 import { StaticMap } from "./MapLayers";
 import { floodValue, NO_DATA } from "@/lib/flood";
+import { groundValue } from "@/lib/ground";
+import { priceLine } from "@/lib/price";
 import type { Place } from "@/lib/places";
 
 const C = {
@@ -99,8 +101,8 @@ async function draw(canvas: HTMLCanvasElement, place: Place) {
   const rows: [string, string, boolean][] = [
     ...place.eras.map((e) => [e.era, e.title, true] as [string, string, boolean]),
     ["浸水の想定", floodValue(place.flood), false],
-    ["地盤", place.ground.value, false],
-    ["地価", `1㎡あたり ${place.price.manYen.toFixed(1)}万円`, false],
+    ["地盤", groundValue(place.ground), false],
+    ["地価", priceLine(place.price), false],
   ];
   const boxH = 92 + sumH + 28 + rows.length * rowH + 30 + 56;
   const boxY = Math.min(Math.max(py + 120, 640), h - 330 - 24 - boxH);

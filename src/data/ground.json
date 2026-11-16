@@ -1,0 +1,22 @@
+{
+  "source": {
+    "name": "国土地理院 土地条件図",
+    "version": null,
+    "retrievedAt": null,
+    "memo": "取得できなかったため、値は未確認（null）。確かめられた町から入れていく。"
+  },
+  "places": [
+    { "slug": "ohashi-2", "value": null, "note": null },
+    { "slug": "iseri-3", "value": null, "note": null },
+    { "slug": "takeshita-3", "value": null, "note": null },
+    { "slug": "itazuke-3", "value": null, "note": null },
+    { "slug": "tamura-3", "value": null, "note": null },
+    { "slug": "meinohama-ekiminami-1", "value": null, "note": null },
+    { "slug": "befu-3", "value": null, "note": null },
+    { "slug": "nishijin-4", "value": null, "note": null },
+    { "slug": "ropponmatsu-2", "value": null, "note": null },
+    { "slug": "nagaoka-3", "value": null, "note": null },
+    { "slug": "hakozaki-1", "value": null, "note": null },
+    { "slug": "maizuru-2", "value": null, "note": null }
+  ]
+}
