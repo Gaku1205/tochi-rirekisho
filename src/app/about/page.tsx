@@ -227,7 +227,7 @@ export default function About() {
               </div>
             ))}
             <p className="sheet-end">
-              浸水は、国土数値情報の洪水浸水想定区域を町の地点で調べた値です（確かめられていない町は「データなし」）。地盤・地価の数値は、公開データから町ごとに写した試作の値です。
+              浸水は、国土数値情報の洪水浸水想定区域を町の地点で調べた値です（確かめられていない町は「データなし」）。地盤は国土地理院の土地条件図、地価は国土交通省の地価公示を、それぞれ町の地点で調べた値です（確かめられていない町は「データなし」）。
               <br />
               写真：そらみみ「View of Ohashi Station (Fukuoka)」「Camphor tree in front of west entrance of Ohashi
               Station (Fukuoka)」CC BY-SA 4.0、Wikimedia Commons

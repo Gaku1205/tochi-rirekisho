@@ -4,6 +4,8 @@ import { StaticMap } from "./MapLayers";
 import SearchForm from "./SearchForm";
 import { ERA_INFO } from "@/lib/layers";
 import { floodNote, floodValue, NO_DATA } from "@/lib/flood";
+import { groundNote, groundValue } from "@/lib/ground";
+import { priceNote, priceValue } from "@/lib/price";
 import { address, fullName, type Place } from "@/lib/places";
 import type { SimilarPlace } from "@/lib/similar";
 
@@ -83,18 +85,22 @@ export default function RecordSheet({
         </li>
         <li className="hz" data-reveal="row">
           <span className="k">地盤</span>
-          <span className="name hz-word">{place.ground.value}</span>
-          <p>{place.ground.note}</p>
+          <span className={place.ground.value === null ? "name hz-word hz-nodata" : "name hz-word"}>
+            {groundValue(place.ground)}
+          </span>
+          <p>{groundNote(place.ground)}</p>
         </li>
         <li className="hz" data-reveal="row">
           <span className="k">地価（1㎡あたり）</span>
-          <span className="yr hz-fig">
-            {place.price.manYen.toFixed(1)}
-            <small>万円</small>
-          </span>
-          <p>
-            10年で {place.price.change10y}% 上がった（{place.price.note}）。
-          </p>
+          {priceValue(place.price) === NO_DATA ? (
+            <span className="name hz-word hz-nodata">{NO_DATA}</span>
+          ) : (
+            <span className="yr hz-fig">
+              {priceValue(place.price)}
+              <small>万円</small>
+            </span>
+          )}
+          <p>{priceNote(place.price)}</p>
         </li>
       </ol>
 
@@ -127,7 +133,7 @@ export default function RecordSheet({
 
       <p className="credit">
         地図：五万分の一地形図「FUKUOKA」（米陸軍地図局、1945年刷り。もとは1926〜29年の日本の測量）パブリックドメイン、Wikimedia
-        Commons／空中写真と今の地図：地理院タイル（国土地理院）／浸水：国土数値情報の洪水浸水想定区域（国土交通省）を町の地点で調べた値／地盤・地価：土地条件図、地価公示をもとにした試作の値。
+        Commons／空中写真と今の地図：地理院タイル（国土地理院）／浸水：国土数値情報の洪水浸水想定区域（国土交通省）を町の地点で調べた値／地盤：土地条件図（国土地理院）／地価：地価公示（国土交通省）。どちらも町の地点で調べた値で、確かめられていない町は「データなし」。
         <Link href="/about">データの出どころ</Link>
       </p>
     </div>

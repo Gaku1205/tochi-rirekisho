@@ -1,5 +1,7 @@
 // AIの要約に渡す「事実の表」。町の記録をテキストにする。LLMにはこの表だけを渡す。
-import { floodNote, floodValue } from "./flood";
+import { floodNote, floodValue, NO_DATA } from "./flood";
+import { groundNote, groundValue } from "./ground";
+import { priceNote, priceValue } from "./price";
 import { address, type Place } from "./places";
 
 export function summaryTable(p: Place): string {
@@ -12,7 +14,8 @@ export function summaryTable(p: Place): string {
   }
   lines.push("");
   lines.push(`浸水の想定: ${floodValue(p.flood)}。${floodNote(p.flood)}（出どころ: ${p.flood.source.name}）`);
-  lines.push(`地盤: ${p.ground.value}。${p.ground.note}`);
-  lines.push(`地価: 1平方メートルあたり${p.price.manYen}万円、10年で${p.price.change10y}%の変化（${p.price.note}）`);
+  lines.push(`地盤: ${groundValue(p.ground)}。${groundNote(p.ground)}（出どころ: ${p.ground.source.name}）`);
+  const priceText = p.price.manYen === null ? NO_DATA : `1平方メートルあたり${priceValue(p.price)}万円`;
+  lines.push(`地価: ${priceText}。${priceNote(p.price)}（出どころ: ${p.price.source.name}）`);
   return lines.join("\n");
 }
