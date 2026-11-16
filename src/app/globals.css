@@ -334,6 +334,39 @@ a {
   z-index: 2;
 }
 
+/* 地図で選んだ地点の札 */
+.map-card {
+  position: absolute;
+  z-index: 5;
+  transform: translate(-50%, calc(-100% - 20px));
+  background: var(--sand);
+  color: var(--ink);
+  padding: 14px 16px 16px;
+  display: grid;
+  gap: 12px;
+  cursor: default;
+}
+
+.map-card-below {
+  transform: translate(-50%, 20px);
+}
+
+.map-card-town {
+  margin: 0;
+  font: 800 28px/1.1 var(--f-name-stack);
+  letter-spacing: -0.02em;
+}
+
+.map-card-far {
+  margin: 0;
+  font: 500 16px/1.6 var(--f-jp-only);
+}
+
+.map-card .btn {
+  width: 100%;
+  padding: 0 12px;
+}
+
 .map-mark {
   position: absolute;
   z-index: 2;
@@ -876,12 +909,19 @@ a {
   top: 0;
   height: 100svh;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto auto;
   min-width: 0;
 }
 
 .side-map {
   height: 100%;
+}
+
+.side-note {
+  margin: 0;
+  padding: 10px 16px 12px;
+  font: 400 15px/1.5 var(--f-jp-only);
+  color: var(--soft);
 }
 
 .strip {
