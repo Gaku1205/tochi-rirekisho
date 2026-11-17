@@ -1381,6 +1381,13 @@ a {
   .map-mark-far {
     display: none;
   }
+
+  /* 狭い幅では見出しを折り返して、カードの外にはみ出さない */
+  .lost-title {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.15;
+  }
 }
 
 @media (max-width: 500px) {
