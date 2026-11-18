@@ -1352,6 +1352,30 @@ a {
   color: var(--ink);
 }
 
+.lost-towns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.lost-towns a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 14px;
+  background: var(--sand2);
+  color: var(--ink);
+  font: 500 16px/1 var(--f-jp-only);
+  text-decoration: none;
+}
+
+.lost-towns a:hover {
+  background: var(--sand3);
+}
+
 .lost-example {
   position: relative;
   display: block;

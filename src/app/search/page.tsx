@@ -65,15 +65,25 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
           </h1>
           <p className="lost-text">
             {r.kind === "outside"
-              ? `「${q}」は福岡市の外のようです。いま調べられるのは、福岡市の7区（東区・博多区・中央区・南区・城南区・早良区・西区）だけです。`
+              ? `「${q}」は福岡市の外のようです。いま調べられるのは、福岡市の7区（東区・博多区・中央区・南区・城南区・早良区・西区）だけです。下の町から選べます。`
               : q
-                ? `「${q}」の記録はまだありません。町名と丁目まで（例：南区大橋2丁目）入れるか、地図の上の札から選んでください。`
-                : "町名と丁目まで（例：南区大橋2丁目）入れるか、地図の上の札から選んでください。"}
+                ? `「${q}」の記録はまだありません。町名と丁目まで（例：南区大橋2丁目）入れるか、下の町から選んでください。`
+                : "町名と丁目まで（例：南区大橋2丁目）入れるか、下の町から選んでください。"}
           </p>
           <SearchForm initial={q} />
           <p className="lost-count">
             いま調べられる町：<span className="yr">{PLACES.length}</span>
           </p>
+          <ul className="lost-towns" aria-label="調べられる町">
+            {PLACES.map((p) => (
+              <li key={p.slug}>
+                <Link href={`/tochi/${p.slug}`}>
+                  {p.town}
+                  {p.block}
+                </Link>
+              </li>
+            ))}
+          </ul>
           <Link href="/" className="lost-example">
             <StaticMap layer={ERA_INFO["1975"].layer} center={DEFAULT_PLACE.at} zoom={15} size={{ w: 480, h: 200 }}>
               <span className="map-pin" style={{ left: "50%", top: "50%" }} aria-hidden="true" />
