@@ -16,6 +16,7 @@
   --moss: #4f6238;
   --deep: #3f5a2a;
   --on-ink: #cfc8b8;
+  --ink-hover: #3a3a35;
   --f-body: var(--f-jost), var(--f-jp), "Hiragino Sans", sans-serif;
   --f-jp-only: var(--f-jp), "Hiragino Sans", sans-serif;
   --f-name-stack: var(--f-name), "Hiragino Mincho ProN", serif;
@@ -966,7 +967,7 @@ a {
 }
 
 .strip-btn:hover:not([aria-pressed="true"]) {
-  background: #3a3a35;
+  background: var(--ink-hover);
 }
 
 .strip-btn:focus-visible {
@@ -2125,7 +2126,7 @@ a {
 }
 
 .btn-ink:hover {
-  background: #3a3a35;
+  background: var(--ink-hover);
 }
 
 .card-msg {

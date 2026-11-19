@@ -15,7 +15,7 @@ const C = {
   sand: "#DDD6C6",
   sand2: "#D2CAB8",
   ink: "#2A2A26",
-  soft: "#59574E",
+  soft: "#4F4D45",
   moss: "#4F6238",
   deep: "#3F5A2A",
   onInk: "#CFC8B8",
