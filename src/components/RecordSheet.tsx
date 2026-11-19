@@ -49,7 +49,7 @@ export default function RecordSheet({
 
       <div className="verdict">
         <p>{place.summary}</p>
-        <p className="verdict-note">年代ごとの地図と、浸水・地盤・地価の公開データから、AIが読み解いた要約</p>
+        <p className="verdict-note">年代ごとの地図から読み取った、昔の土地の様子の要約</p>
       </div>
 
       <ol className="rows" aria-label={`${fullName(place)}の記録`}>
