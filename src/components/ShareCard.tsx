@@ -122,7 +122,7 @@ async function draw(canvas: HTMLCanvasElement, place: Place) {
   sumLines.forEach((l, i) => ctx.fillText(l, boxX + pad + 32, y + 80 + i * 68));
   ctx.fillStyle = C.onInk;
   ctx.font = `400 26px ${fJp}`;
-  ctx.fillText("年代ごとの地図と公開データから、AIが読み解いた要約", boxX + pad + 32, y + sumH - 30);
+  ctx.fillText("年代ごとの地図から読み取った、昔の土地の様子の要約", boxX + pad + 32, y + sumH - 30);
   y += sumH + 28;
 
   // 記録の行

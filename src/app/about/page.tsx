@@ -33,7 +33,7 @@ const SOURCES: { group: string; items: Source[] }[] = [
   },
   {
     group: "地価",
-    items: [{ name: "地価公示", who: "国土交通省 2016・2026年", text: "町にいちばん近い地点の1㎡あたりの価格と、10年の変化。" }],
+    items: [{ name: "地価公示", who: "国土交通省", text: "町にいちばん近い地点の1㎡あたりの価格と、10年の変化。" }],
   },
   {
     group: "AIの読み解き",
