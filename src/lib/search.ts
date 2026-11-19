@@ -46,13 +46,22 @@ export function searchAddress(raw: string): SearchResult {
   const q = normalize(raw);
   if (!q) return { kind: "unknown", query: raw };
   if (OTHER_CITIES.some((c) => q.includes(c))) return { kind: "outside", query: raw };
-  const body = q.replace(/^福岡市/, "").replace(/^(東区|博多区|中央区|南区|城南区|早良区|西区)/, "");
-  const hit =
-    PLACES.find((p) => body.startsWith(p.town + p.block)) ??
-    PLACES.find((p) => body === p.town || body.startsWith(p.kana)) ??
-    PLACES.find((p) => body.startsWith(p.town) && !p.block);
-  if (hit) return { kind: "found", place: hit };
-  const sameTown = PLACES.find((p) => body.startsWith(p.town));
-  if (sameTown) return { kind: "found", place: sameTown };
+  const afterCity = q.replace(/^福岡市/, "");
+  const wardMatch = afterCity.match(/^(東区|博多区|中央区|南区|城南区|早良区|西区)/);
+  const ward = wardMatch ? wardMatch[1] : null;
+  const body = ward ? afterCity.slice(ward.length) : afterCity;
+
+  // 町名（または読み）で始まる記録のうち、丁目の決まりに合うものを探す（docs/spec.md「住所の一致の決まり」）
+  for (const p of PLACES) {
+    const prefix = body.startsWith(p.town) ? p.town : body.startsWith(p.kana) ? p.kana : null;
+    if (!prefix) continue;
+    if (ward && ward !== p.ward) continue;
+    const chome = body.slice(prefix.length).match(/^(\d+)丁目/);
+    if (chome) {
+      if (`${chome[1]}丁目` === p.block) return { kind: "found", place: p };
+    } else if (PLACES.filter((o) => o.town === p.town).length === 1) {
+      return { kind: "found", place: p };
+    }
+  }
   return { kind: "unknown", query: raw };
 }

@@ -19,6 +19,26 @@ describe("searchAddress", () => {
   it("福岡市の外は「範囲の外」", () => {
     expect(searchAddress("春日市須玖北").kind).toBe("outside");
   });
+  it("記録の無い丁目は、別の丁目に飛ばさず「見つからない」", () => {
+    expect(searchAddress("大橋5丁目").kind).toBe("unknown");
+    expect(searchAddress("福岡市南区大橋1丁目").kind).toBe("unknown");
+  });
+  it("違う区は「見つからない」、合う区なら見つかる", () => {
+    expect(searchAddress("東区大橋2丁目").kind).toBe("unknown");
+    expect(searchAddress("福岡市東区大橋2丁目").kind).toBe("unknown");
+    const r = searchAddress("南区大橋2丁目");
+    expect(r.kind === "found" && r.place.slug).toBe("ohashi-2");
+  });
+  it("丁目が無い町名だけは、記録が1つなら見つかる", () => {
+    const r = searchAddress("大橋");
+    expect(r.kind === "found" && r.place.slug).toBe("ohashi-2");
+    const k = searchAddress("おおはし");
+    expect(k.kind === "found" && k.place.slug).toBe("ohashi-2");
+  });
+  it("ほかの市は、区や丁目が合って見えても「範囲の外」", () => {
+    expect(searchAddress("久留米市大橋2丁目").kind).toBe("outside");
+    expect(searchAddress("東京都大橋2丁目").kind).toBe("outside");
+  });
   it("記録の無い町は「見つからない」", () => {
     expect(searchAddress("福岡市南区大楠1丁目").kind).toBe("unknown");
     expect(searchAddress("").kind).toBe("unknown");
